@@ -2393,6 +2393,8 @@ class QueryTrackerApp(tk.Tk):
         self.list_page=tk.Frame(self.page_container,bg=BG)
         self.calendar_page=tk.Frame(self.page_container,bg=BG)
         self.reports_page=tk.Frame(self.page_container,bg=BG)
+        for page in (self.dashboard_page, self.list_page, self.calendar_page, self.reports_page):
+            page.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         lp=self.list_page
         self.metrics_frame=tk.Frame(lp,bg=BG); self.metrics_frame.pack(fill="x",padx=20,pady=(18,0))
@@ -2555,22 +2557,21 @@ class QueryTrackerApp(tk.Tk):
         if not init and getattr(self,"_current_page",None)==page:
             return
         self._current_page=page
-        self.dashboard_page.pack_forget(); self.list_page.pack_forget(); self.calendar_page.pack_forget(); self.reports_page.pack_forget()
         if page=="dashboard":
-            self.dashboard_page.pack(fill="both",expand=True)
+            self.dashboard_page.tkraise()
             if getattr(self,"_dash_dirty",True):
                 self.after_idle(self._refresh_dashboard)
                 self._dash_dirty=False
         elif page=="calendar":
-            self.calendar_page.pack(fill="both",expand=True)
+            self.calendar_page.tkraise()
             self.after_idle(self._refresh_calendar_page)
         elif page=="reports":
-            self.reports_page.pack(fill="both",expand=True)
+            self.reports_page.tkraise()
             if getattr(self,"_rpt_dirty",True):
                 self.after_idle(self._refresh_reports)
                 self._rpt_dirty=False
         else:
-            self.list_page.pack(fill="both",expand=True)
+            self.list_page.tkraise()
             if not init:
                 self.after_idle(self._refresh_table)
         # Watcher runs on ALL pages — drop inbox should work wherever you are
