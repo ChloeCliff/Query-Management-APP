@@ -968,8 +968,37 @@ def load_queries(excel_file):
         queries.append(q)
     return queries
 
+def _merge_queries_for_save(local_queries, excel_file):
+    """Merge local in-memory queries with current on-disk queries by ID.
+
+    This reduces accidental overwrite when two users save around the same time
+    and are editing different queries.
+    """
+    remote_queries = load_queries(excel_file) if excel_file else []
+    remote_by_id = {str(q.get("id", "")): q for q in remote_queries if q.get("id")}
+    local_by_id = {str(q.get("id", "")): q for q in local_queries if q.get("id")}
+
+    merged_ids = []
+    for q in remote_queries:
+        qid = str(q.get("id", ""))
+        if qid and qid not in merged_ids:
+            merged_ids.append(qid)
+    for q in local_queries:
+        qid = str(q.get("id", ""))
+        if qid and qid not in merged_ids:
+            merged_ids.append(qid)
+
+    merged = []
+    for qid in merged_ids:
+        if qid in local_by_id:
+            merged.append(local_by_id[qid])
+        elif qid in remote_by_id:
+            merged.append(remote_by_id[qid])
+    return merged
+
 def save_all_queries(queries,excel_file):
     if not excel_file: return
+    queries = _merge_queries_for_save(queries, excel_file)
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Queries"
     thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
     hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
