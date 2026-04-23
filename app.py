@@ -214,9 +214,16 @@ def _setup_dnd(toplevel, callback):
         print(f"DnD setup failed: {e}")
         return False
 
-# Directory the exe (or script) lives in — used for all relative paths
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+# Directory the exe (or script) lives in — used for user data/config paths.
+APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+# Directory bundled resources are loaded from when packaged with PyInstaller.
+RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+# Store user-specific settings locally so teammates do not overwrite each
+# other's name/path settings when they all run the same shared exe.
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "QBOX")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 # Default data paths — created automatically so the team never has to browse
 DEFAULT_DATA_DIR    = os.path.join(APP_DIR, "Data")
@@ -229,7 +236,14 @@ def _ensure_app_folders():
     for folder in (DEFAULT_DATA_DIR, DEFAULT_BACKUP_DIR, DEFAULT_ATTACH_DIR):
         os.makedirs(folder, exist_ok=True)
 
+def _ensure_config_folder():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+def resource_path(*parts):
+    return os.path.join(RESOURCE_DIR, *parts)
+
 _ensure_app_folders()
+_ensure_config_folder()
 
 DEFAULT_QUERY_TYPES = [
     "Sub-Meter reads","Tenancy change","Recharge rework","New instruction",
@@ -260,15 +274,21 @@ SPELLCHECK_SKIP_WORDS = {
     "query", "queries", "site", "sites", "fund", "funds", "prop",
     "props", "utility", "utilities", "serial", "serials",
 }
-SPELLCHECKER = SpellChecker(language="en") if SpellChecker else None
+if SpellChecker:
+    try:
+        SPELLCHECKER = SpellChecker(language="en")
+    except Exception:
+        SPELLCHECKER = None
+else:
+    SPELLCHECKER = None
 
-if SpellChecker is None:
+if SPELLCHECKER is None:
     import atexit
     _spell_warning_shown = [False]
     def _show_spell_install_hint():
         if not _spell_warning_shown[0]:
             _spell_warning_shown[0] = True
-            print("\n⚠  Spell check is not available. Install via:\n  pip install pyspellchecker\n")
+            print("\nSpell check is unavailable for this build. Install/rebuild with pyspellchecker data included.\n")
     atexit.register(_show_spell_install_hint)
 
 # ── Theme definitions ────────────────────────────────────────────────────────
@@ -426,6 +446,14 @@ def load_config():
         try:
             with open(CONFIG_FILE) as f: return json.load(f)
         except: pass
+    if os.path.exists(LEGACY_CONFIG_FILE):
+        try:
+            with open(LEGACY_CONFIG_FILE) as f:
+                cfg=json.load(f)
+            save_config(cfg)
+            return cfg
+        except:
+            pass
     return {}
 
 def get_query_types():
@@ -442,6 +470,7 @@ def get_team_members():
 QUERY_TYPES[:] = get_query_types()
 
 def save_config(cfg):
+    _ensure_config_folder()
     with open(CONFIG_FILE,"w") as f: json.dump(cfg,f,indent=2)
 
 def today_str(): return date.today().isoformat()
@@ -1378,19 +1407,31 @@ class SetupWizard(tk.Toplevel):
             tk.Entry(card,textvariable=var,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,
                      relief="flat",bd=8,highlightthickness=0).pack(fill="x")
             def browse(v=var,sm=save_mode):
-                p=(filedialog.asksaveasfilename(title="Choose location",defaultextension=".xlsx",
-                   filetypes=[("Excel files","*.xlsx")],initialfile="query_tracker.xlsx") if sm
-                   else filedialog.askopenfilename(title="Find sites.xlsx",filetypes=[("Excel files","*.xlsx")]))
+                current=v.get().strip()
+                initial_dir=os.path.dirname(current) if current and os.path.dirname(current) else DEFAULT_DATA_DIR
+                if sm:
+                    # Always use open-file picker — never overwrite
+                    p=filedialog.askopenfilename(
+                        title="Select your query_tracker.xlsx",
+                        initialdir=initial_dir,
+                        filetypes=[("Excel files","*.xlsx"),("All files","*.*")],
+                    )
+                else:
+                    p=filedialog.askopenfilename(
+                        title="Find sites.xlsx",
+                        initialdir=initial_dir,
+                        filetypes=[("Excel files","*.xlsx")],
+                    )
                 if p: v.set(p)
             make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
             return var
 
-        # Pre-fill with the default path (Data\query_tracker.xlsx next to the exe)
-        # so team members on SharePoint don't need to browse — just confirm and go.
+        # Only pre-fill the default path when there is no saved setting at all
+        # (i.e. very first launch). Do not overwrite a saved path from a previous session.
         if not self.cfg.get("excel_file"):
             self.cfg["excel_file"] = DEFAULT_EXCEL_FILE
         self.excel_var=path_row("Query data file",
-            "Pre-filled to Data\\query_tracker.xlsx next to the app. Change only if you use a different location.","excel_file",save_mode=True)
+            "Click Browse to select your shared query_tracker.xlsx. Your choice is remembered for next time.","excel_file",save_mode=True)
         self.sites_var=path_row("Site list (sites.xlsx)",
             "Point to your sites.xlsx in the same shared folder.","sites_file")
 
@@ -1952,7 +1993,7 @@ class QueryTrackerApp(tk.Tk):
         
         # Set app icon
         try:
-            icon_path = os.path.join(os.path.dirname(__file__), "qbox-icon-256.png")
+            icon_path = resource_path("qbox-icon-256.png")
             if os.path.exists(icon_path):
                 photo = tk.PhotoImage(file=icon_path)
                 self.iconphoto(False, photo)
@@ -2154,7 +2195,7 @@ class QueryTrackerApp(tk.Tk):
         logo_pill=tk.Frame(left,bg=ACCENT,padx=8,pady=3); logo_pill.pack(side="left",padx=(0,12))
         logo_img=None
         for icon_name in ["qbox-icon-64.png","qbox-icon-128.png","qbox-icon-256.png"]:
-            icon_path=os.path.join(os.path.dirname(__file__),icon_name)
+            icon_path=resource_path(icon_name)
             if os.path.exists(icon_path):
                 try:
                     logo_img=tk.PhotoImage(file=icon_path)

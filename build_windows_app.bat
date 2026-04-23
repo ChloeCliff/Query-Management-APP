@@ -6,49 +6,87 @@ echo ==========================================
 echo Building QBOX Windows application...
 echo ==========================================
 
+set "PY_CMD="
+set "ICON_ARGS="
+set "DATA_ARGS="
+set "RELEASE_DIR=QBOX"
+set "BUILD_ARCHIVE_DIR=%RELEASE_DIR%\_build"
+
 where py >nul 2>nul
-if errorlevel 1 (
-  echo [ERROR] Python launcher (py) not found.
-  echo Install Python 3.11+ from python.org and retry.
+if not errorlevel 1 set "PY_CMD=py -3"
+if "%PY_CMD%"=="" (
+  where python >nul 2>nul
+  if not errorlevel 1 set "PY_CMD=python"
+)
+if "%PY_CMD%"=="" (
+  echo [ERROR] Python not found.
+  echo Install Python 3.11+ and ensure it is on PATH.
   exit /b 1
 )
 
-echo [1/5] Installing build dependencies...
-py -3 -m pip install --upgrade pip >nul
-py -3 -m pip install pyinstaller openpyxl pyspellchecker
+echo [1/6] Installing build dependencies...
+%PY_CMD% -m pip install --disable-pip-version-check --no-input --upgrade pip
+if errorlevel 1 (
+  echo [ERROR] Failed to upgrade pip.
+  exit /b 1
+)
+%PY_CMD% -m pip install --disable-pip-version-check --no-input pyinstaller openpyxl pyspellchecker pillow cairosvg
 if errorlevel 1 (
   echo [ERROR] Failed to install dependencies.
   exit /b 1
 )
 
-echo [2/5] Cleaning previous build output...
+echo [2/6] Cleaning previous build output...
 if exist build      rmdir /s /q build
 if exist dist       rmdir /s /q dist
+if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
 if exist QBOX.spec  del /q QBOX.spec
-if exist QBOX.zip   del /q QBOX.zip
 
-echo [3/5] Running PyInstaller...
-py -3 -m PyInstaller --noconfirm --clean --windowed --name QBOX app.py
+echo [3/6] Generating icon assets...
+if exist "qbox-logo.svg" (
+  echo     - Running generate_icons.py
+  %PY_CMD% generate_icons.py
+  if errorlevel 1 (
+    echo [ERROR] Failed to generate icon assets.
+    exit /b 1
+  )
+  if exist "qbox.ico" set "ICON_ARGS=--icon qbox.ico"
+  set "DATA_ARGS=--add-data qbox-logo.svg;."
+) else (
+  echo [WARNING] qbox-logo.svg not found. Building without custom icon assets.
+)
+if exist "qbox-icon-64.png"  set "DATA_ARGS=%DATA_ARGS% --add-data qbox-icon-64.png;."
+if exist "qbox-icon-128.png" set "DATA_ARGS=%DATA_ARGS% --add-data qbox-icon-128.png;."
+if exist "qbox-icon-256.png" set "DATA_ARGS=%DATA_ARGS% --add-data qbox-icon-256.png;."
+
+echo [4/6] Running PyInstaller one-file build...
+%PY_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --name QBOX --collect-data spellchecker --hidden-import spellchecker.resources %DATA_ARGS% %ICON_ARGS% app.py
 if errorlevel 1 (
   echo [ERROR] Build failed.
   exit /b 1
 )
 
-echo [4/5] Creating distribution folder structure...
-if not exist "dist\QBOX\Data"           mkdir "dist\QBOX\Data"
-if not exist "dist\QBOX\Data\Backups"   mkdir "dist\QBOX\Data\Backups"
-if not exist "dist\QBOX\ATTACHMENTS"    mkdir "dist\QBOX\ATTACHMENTS"
+echo [5/6] Creating release folder structure...
+mkdir "%RELEASE_DIR%"
+mkdir "%RELEASE_DIR%\ATTACHMENTS"
+mkdir "%RELEASE_DIR%\Data"
+mkdir "%RELEASE_DIR%\Data\Backups"
+mkdir "%BUILD_ARCHIVE_DIR%"
 
-rem Copy the first-run setup helper into the distribution
-copy /y "setup_folders.bat" "dist\QBOX\setup_folders.bat" >nul
-
-echo [5/5] Creating QBOX.zip for SharePoint upload...
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\QBOX\*' -DestinationPath 'QBOX.zip' -Force"
+copy /y "dist\QBOX.exe" "%RELEASE_DIR%\QBOX.exe" >nul
 if errorlevel 1 (
-  echo [WARNING] Could not create QBOX.zip (PowerShell error). Upload dist\QBOX\ manually.
-) else (
-  echo.
-  echo  QBOX.zip created successfully.
+  echo [ERROR] Could not copy QBOX.exe into the release folder.
+  exit /b 1
+)
+
+if exist "setup_folders.bat" copy /y "setup_folders.bat" "%RELEASE_DIR%\setup_folders.bat" >nul
+if exist "QBOX.spec" copy /y "QBOX.spec" "%BUILD_ARCHIVE_DIR%\QBOX.spec" >nul
+if exist "dist\QBOX.exe" copy /y "dist\QBOX.exe" "%BUILD_ARCHIVE_DIR%\QBOX.exe" >nul
+
+echo [6/6] Build final checks...
+if not exist "%RELEASE_DIR%\QBOX.exe" (
+  echo [ERROR] Release exe was not generated.
+  exit /b 1
 )
 
 echo.
@@ -56,14 +94,15 @@ echo ==========================================
 echo  Build complete
 echo ==========================================
 echo.
-echo  Upload QBOX.zip to your team SharePoint.
-echo  Team members:
-echo    1. Download QBOX.zip from SharePoint
-echo    2. Extract to a local folder (e.g. C:\QBOX)
-echo    3. Run setup_folders.bat once (creates Data\ and ATTACHMENTS\)
-echo    4. Copy your query_tracker.xlsx into Data\
-echo    5. Launch QBOX.exe
+echo  Release folder: %RELEASE_DIR%\
 echo.
-echo  Daily backups are saved automatically to Data\Backups\.
+echo    %RELEASE_DIR%\QBOX.exe
+echo    %RELEASE_DIR%\ATTACHMENTS\
+echo    %RELEASE_DIR%\Data\
+echo    %RELEASE_DIR%\Data\Backups\
+echo    %RELEASE_DIR%\_build\
+echo.
+echo  Share the entire QBOX folder with each team.
+echo  The app will keep query_tracker.xlsx and backups in Data\.
 echo ==========================================
 exit /b 0
