@@ -1,0 +1,52 @@
+<svg width="100%" viewBox="0 0 680 500" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- Background panel (translucent) -->
+  <rect x="140" y="30" width="400" height="440" rx="20" fill="#1a1230" opacity="0.1"/>
+
+  <!-- Pixel corner decorations (on outside, border goes through) -->
+  <!-- Top-left -->
+  <rect x="206" y="92"  width="12" height="12" fill="#7B5EA7"/>
+  <rect x="218" y="92"  width="12" height="12" fill="#9B6FD4"/>
+  <rect x="206" y="104"  width="12" height="12" fill="#9B6FD4"/>
+  <rect x="218" y="104"  width="12" height="12" fill="#B87FEE"/>
+
+  <!-- Top-right -->
+  <rect x="444" y="92"  width="12" height="12" fill="#9B6FD4"/>
+  <rect x="456" y="92"  width="12" height="12" fill="#7B5EA7"/>
+  <rect x="444" y="104"  width="12" height="12" fill="#B87FEE"/>
+  <rect x="456" y="104"  width="12" height="12" fill="#9B6FD4"/>
+
+  <!-- Bottom-left -->
+  <rect x="206" y="300" width="12" height="12" fill="#9B6FD4"/>
+  <rect x="218" y="300" width="12" height="12" fill="#B87FEE"/>
+  <rect x="206" y="312" width="12" height="12" fill="#7B5EA7"/>
+  <rect x="218" y="312" width="12" height="12" fill="#9B6FD4"/>
+
+  <!-- Bottom-right -->
+  <rect x="444" y="300" width="12" height="12" fill="#B87FEE"/>
+  <rect x="456" y="300" width="12" height="12" fill="#9B6FD4"/>
+  <rect x="444" y="312" width="12" height="12" fill="#9B6FD4"/>
+  <rect x="456" y="312" width="12" height="12" fill="#7B5EA7"/>
+
+  <!-- Main box outline -->
+  <rect x="214" y="100" width="252" height="216" rx="16" fill="none" stroke="#9B6FD4" stroke-width="3" opacity="0.5"/>
+
+  <!-- Q letter -->
+  <rect x="240" y="115" width="200" height="186" rx="18" fill="none" stroke="#C490F8" stroke-width="6"/>
+  <rect x="275" y="148" width="130" height="120" rx="8" fill="#1a1230"/>
+  <rect x="355" y="258" width="36" height="14" rx="4" fill="#C490F8"/>
+  <rect x="375" y="248" width="16" height="24" rx="4" fill="#C490F8"/>
+
+  <!-- QBOX wordmark (inside box) -->
+  <text
+    x="340"
+    y="208"
+    text-anchor="middle"
+    dominant-baseline="central"
+    font-family="'Courier New', monospace"
+    font-size="42"
+    font-weight="700"
+    letter-spacing="5"
+    fill="#ffffff">QBOX</text>
+
+</svg>
