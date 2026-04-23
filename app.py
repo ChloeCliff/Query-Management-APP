@@ -2112,6 +2112,12 @@ class QueryTrackerApp(tk.Tk):
         self._watcher_running = False
         self._auto_reload_running = False
         self._backup_running = False
+        try:
+            if getattr(self,"_save_retry_after_id",None):
+                self.after_cancel(self._save_retry_after_id)
+                self._save_retry_after_id=None
+        except Exception:
+            pass
         self._do_daily_backup(forced=True)   # snapshot on exit
         self.destroy()
 
@@ -2279,6 +2285,11 @@ class QueryTrackerApp(tk.Tk):
         self._auto_reload_thread=None
         self._excel_mtime=self._get_excel_mtime()
         self._reload_tick=0
+        # Save queue state (auto-retry while file is locked/syncing)
+        self._save_pending=False
+        self._save_in_progress=False
+        self._save_retry_after_id=None
+        self._save_retry_count=0
         self._build_ui(); self.deiconify()
         self._refresh_table(); self._show_daily_banner()
         self._start_auto_reload()
@@ -4420,6 +4431,8 @@ class QueryTrackerApp(tk.Tk):
     def _silent_reload(self):
         """Reload queries from disk without disrupting any open dialogs."""
         try:
+            if getattr(self,"_save_pending",False):
+                return
             fresh=load_queries(self.excel_file)
             if fresh is not None:
                 self.queries=fresh
@@ -4532,7 +4545,7 @@ class QueryTrackerApp(tk.Tk):
             if dest_name:
                 os.remove(fpath)
                 q["log"] += " | " + stamp(self.username) + f" Auto-filed attachment: {dest_name}"
-                save_all_queries(self.queries, self.excel_file)
+                self._save_queries()
                 self._refresh_table()
                 _show_toast(self,
                     f"✓  Filed under {q['ref']}\n{dest_name}",
@@ -5200,23 +5213,54 @@ class QueryTrackerApp(tk.Tk):
         for idx,(_,iid) in enumerate(items): self.tree.move(iid,"",idx)
 
     def _save_queries(self):
-        """Save queries to Excel and mark dashboard/reports as needing rebuild."""
-        try:
-            save_all_queries(self.queries,self.excel_file)
-        except PermissionError:
-            messagebox.showerror(
-                "Save failed",
-                "Could not save the tracker because the Excel file is open. Close it and try again.",
-                parent=self,
-            )
+        """Queue save to Excel and retry automatically while file is locked/syncing."""
+        if not self.excel_file:
+            messagebox.showerror("Save failed","No query tracker file is configured.",parent=self)
             return False
-        except Exception as exc:
-            messagebox.showerror("Save failed", str(exc), parent=self)
-            return False
-        self._excel_mtime=self._excel_mtime_now()
+        self._save_pending=True
         self._dash_dirty=True
         self._rpt_dirty=True
+        self._flush_save_queue()
         return True
+
+    def _schedule_save_retry(self, delay_ms=3000):
+        try:
+            if self._save_retry_after_id:
+                self.after_cancel(self._save_retry_after_id)
+        except Exception:
+            pass
+        self._save_retry_after_id=self.after(delay_ms,self._flush_save_queue)
+
+    def _flush_save_queue(self):
+        if not getattr(self,"_save_pending",False):
+            return
+        if getattr(self,"_save_in_progress",False):
+            return
+        self._save_in_progress=True
+        try:
+            save_all_queries(self.queries,self.excel_file)
+            self._save_pending=False
+            self._save_retry_count=0
+            self._excel_mtime=self._excel_mtime_now()
+            try:
+                self.sync_lbl.config(text="✓ Saved")
+                self.after(2500,lambda:self.sync_lbl.config(text="● Live") if self.sync_lbl.winfo_exists() else None)
+            except Exception:
+                pass
+        except PermissionError:
+            self._save_retry_count += 1
+            try: self.sync_lbl.config(text="… Save queued (file busy)")
+            except Exception: pass
+            self._schedule_save_retry(3000)
+        except Exception as exc:
+            self._save_retry_count += 1
+            if self._save_retry_count <= 1:
+                _show_toast(self,f"Save queued: {exc}",color=WARNING,duration=4000)
+            try: self.sync_lbl.config(text="… Save queued (retrying)")
+            except Exception: pass
+            self._schedule_save_retry(3000)
+        finally:
+            self._save_in_progress=False
 
     def _reload_sites(self):
         self.clients,self.sites_by_client,self.meters,self.utilities_by_site,\
