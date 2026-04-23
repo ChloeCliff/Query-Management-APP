@@ -2552,24 +2552,27 @@ class QueryTrackerApp(tk.Tk):
         self._show_page("dashboard",init=True)
 
     def _show_page(self,page,init=False):
+        if not init and getattr(self,"_current_page",None)==page:
+            return
+        self._current_page=page
         self.dashboard_page.pack_forget(); self.list_page.pack_forget(); self.calendar_page.pack_forget(); self.reports_page.pack_forget()
         if page=="dashboard":
             self.dashboard_page.pack(fill="both",expand=True)
             if getattr(self,"_dash_dirty",True):
-                self._refresh_dashboard()
+                self.after_idle(self._refresh_dashboard)
                 self._dash_dirty=False
         elif page=="calendar":
             self.calendar_page.pack(fill="both",expand=True)
-            self._refresh_calendar_page()
+            self.after_idle(self._refresh_calendar_page)
         elif page=="reports":
             self.reports_page.pack(fill="both",expand=True)
             if getattr(self,"_rpt_dirty",True):
-                self._refresh_reports()
+                self.after_idle(self._refresh_reports)
                 self._rpt_dirty=False
         else:
             self.list_page.pack(fill="both",expand=True)
             if not init:
-                self._refresh_table()
+                self.after_idle(self._refresh_table)
         # Watcher runs on ALL pages — drop inbox should work wherever you are
         self._start_watcher()
         for v,btn in self._page_btns.items():
@@ -3121,8 +3124,8 @@ class QueryTrackerApp(tk.Tk):
                     try: self.cal_member_var.set("All")
                     except: pass
                     self._dash_dirty=True
-                    self._refresh_dashboard()
-                    self._refresh_table()
+                    self.after_idle(self._refresh_dashboard)
+                    self.after_idle(self._refresh_table)
                 else:
                     self._assignee_filter=person
                     try: self.filter_assignee.set(person)
@@ -3131,8 +3134,18 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
                     # Stay on dashboard and filter there instead of going to list
                     self._dash_dirty=True
-                    self._refresh_dashboard()
-                    self._refresh_table()
+                    self.after_idle(self._refresh_dashboard)
+                    self.after_idle(self._refresh_table)
+
+            def _bind_click_tree(widget, on_click, on_enter, on_leave):
+                try:
+                    widget.bind("<Button-1>", on_click)
+                    widget.bind("<Enter>", on_enter)
+                    widget.bind("<Leave>", on_leave)
+                except Exception:
+                    pass
+                for child in widget.winfo_children():
+                    _bind_click_tree(child, on_click, on_enter, on_leave)
 
             for person in all_members:
                 pqs=[q for q in filtered_queries if q.get("assigned_to","")==person]
@@ -3166,10 +3179,7 @@ class QueryTrackerApp(tk.Tk):
                     def _click(e): set_person_filter(p)
                     def _enter(e): o.configure(highlightbackground=ACCENT2)
                     def _leave(e): o.configure(highlightbackground=ACCENT if af==p else BORDER)
-                    for w in [o]+list(o.winfo_children())+[w2 for ch in o.winfo_children() for w2 in ch.winfo_children()]+\
-                              [w3 for ch in o.winfo_children() for w2 in ch.winfo_children() for w3 in (w2.winfo_children() if hasattr(w2,'winfo_children') else [])]:
-                        try: w.bind("<Button-1>",_click); w.bind("<Enter>",_enter); w.bind("<Leave>",_leave)
-                        except: pass
+                    _bind_click_tree(o,_click,_enter,_leave)
                 bind_person()
 
             # Clear filter button if one is active
@@ -3180,7 +3190,7 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
                     try: self.cal_member_var.set("All")
                     except: pass
-                    self._refresh_dashboard(); self._refresh_table()
+                    self.after_idle(self._refresh_dashboard); self.after_idle(self._refresh_table)
                 make_btn(tm_row,"✕ Clear person filter",clear_pf,"danger",padx=10,pady=6).pack(side="left",padx=(4,0))
 
         # Workload Balance removed from dashboard by request (TEAM section already covers this).
