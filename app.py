@@ -1953,6 +1953,8 @@ class QueryTrackerApp(tk.Tk):
     def _on_close(self):
         self._watcher_running = False
         self._auto_reload_running = False
+        self._backup_running = False
+        self._do_daily_backup(forced=True)   # snapshot on exit
         self.destroy()
 
     def _toggle_mini_window(self):
@@ -2118,6 +2120,7 @@ class QueryTrackerApp(tk.Tk):
         self._build_ui(); self.deiconify()
         self._refresh_table(); self._show_daily_banner()
         self._start_auto_reload()
+        self._start_daily_backup()
         self._start_watcher()   # run from launch, not just when on list page
         try: self.sync_lbl.config(text="● Live")
         except: pass
@@ -4165,6 +4168,64 @@ class QueryTrackerApp(tk.Tk):
 
     def _stop_auto_reload(self):
         self._auto_reload_running=False
+
+    # ── Daily automatic backup ────────────────────────────────────────────────
+    def _start_daily_backup(self):
+        """Start a background thread that takes one backup per calendar day."""
+        if getattr(self, "_backup_running", False):
+            return
+        self._backup_running = True
+        self._last_backup_date = None   # force first-run backup today
+        t = threading.Thread(target=self._daily_backup_loop, daemon=True)
+        t.start()
+
+    def _daily_backup_loop(self):
+        """Wake every 60 seconds; fire a backup whenever the calendar date rolls over."""
+        sleep_event = threading.Event()
+        while getattr(self, "_backup_running", False):
+            today = datetime.now().date()
+            if today != self._last_backup_date:
+                self._do_daily_backup()
+            sleep_event.wait(60)
+            sleep_event.clear()
+
+    def _do_daily_backup(self, forced=False):
+        """Copy query_tracker.xlsx → Data/Backups/query_tracker_YYYY-MM-DD.xlsx.
+
+        forced=True: used on app close — always run even if we already backed
+        up today, so the file contains this session's latest saves.
+        """
+        try:
+            if not self.excel_file or not os.path.exists(self.excel_file):
+                return
+            today = datetime.now().date()
+            if not forced and today == self._last_backup_date:
+                return   # already backed up today
+
+            backup_dir = os.path.join(os.path.dirname(self.excel_file), "Backups")
+            os.makedirs(backup_dir, exist_ok=True)
+
+            stamp = datetime.now().strftime("%Y-%m-%d")
+            dest = os.path.join(backup_dir, f"query_tracker_{stamp}.xlsx")
+            import shutil
+            shutil.copy2(self.excel_file, dest)
+            self._last_backup_date = today
+
+            # Prune backups older than 30 days
+            cutoff = datetime.now().timestamp() - 30 * 86400
+            for f in os.listdir(backup_dir):
+                fp = os.path.join(backup_dir, f)
+                try:
+                    if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                        os.remove(fp)
+                except Exception:
+                    pass
+
+            if not forced:
+                self.after(0, lambda d=dest: _show_toast(self, f"Backup saved: {os.path.basename(d)}"))
+        except Exception:
+            pass
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _auto_reload_loop(self):
         """Poll the Excel file every 30 seconds; reload silently if it changed."""

@@ -33,13 +33,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [4/4] Build complete.
+echo [4/4] Creating distribution folder structure...
+if not exist "dist\QBOX\Data"           mkdir "dist\QBOX\Data"
+if not exist "dist\QBOX\Data\Backups"   mkdir "dist\QBOX\Data\Backups"
+if not exist "dist\QBOX\ATTACHMENTS"    mkdir "dist\QBOX\ATTACHMENTS"
+
+echo [5/4] Build complete.
 echo.
-echo App folder:
-echo   dist\QBOX\
+echo Distribution folder:  dist\QBOX\
 echo.
-echo Exe to run:
-echo   dist\QBOX\QBOX.exe
+echo   dist\QBOX\QBOX.exe          - run the app
+echo   dist\QBOX\Data\             - put query_tracker.xlsx here
+echo   dist\QBOX\Data\Backups\     - auto-backups saved here
+echo   dist\QBOX\ATTACHMENTS\      - attachment files per query
 echo.
-echo Share the entire dist\QBOX folder with your teammate.
+echo Share the entire dist\QBOX folder with your team.
 exit /b 0
