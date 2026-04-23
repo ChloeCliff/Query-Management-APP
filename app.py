@@ -456,17 +456,73 @@ def load_config():
             pass
     return {}
 
-def get_query_types():
-    """Load custom query types from config, falling back to defaults."""
-    cfg=load_config()
+def load_shared_settings(excel_file):
+    """Read query types and team members from the _Settings sheet in the shared tracker.
+    Returns a dict with 'query_types' and 'team_members', or empty dict if not present."""
+    if not excel_file or not os.path.exists(excel_file):
+        return {}
+    try:
+        wb = openpyxl.load_workbook(excel_file, data_only=True)
+        if "_Settings" not in wb.sheetnames:
+            return {}
+        ws = wb["_Settings"]
+        result = {}
+        section = None
+        for row in ws.iter_rows(values_only=True):
+            key = str(row[0] or "").strip()
+            if not key:
+                continue
+            if key == "[query_types]":
+                section = "query_types"; result[section] = []; continue
+            if key == "[team_members]":
+                section = "team_members"; result[section] = []; continue
+            if key.startswith("["):
+                section = None; continue
+            if section and key:
+                result[section].append(key)
+        return result
+    except Exception:
+        return {}
+
+def save_shared_settings(excel_file, query_types, team_members):
+    """Write query types and team members into the _Settings sheet of the shared tracker."""
+    if not excel_file or not os.path.exists(excel_file):
+        return
+    try:
+        wb = openpyxl.load_workbook(excel_file)
+        if "_Settings" in wb.sheetnames:
+            del wb["_Settings"]
+        ws = wb.create_sheet("_Settings")
+        ws["A1"] = "[query_types]"
+        for i, qt in enumerate(query_types, start=2):
+            ws.cell(row=i, column=1, value=qt)
+        row = len(query_types) + 3
+        ws.cell(row=row, column=1, value="[team_members]")
+        for i, tm in enumerate(team_members, start=row+1):
+            ws.cell(row=i, column=1, value=tm)
+        wb.save(excel_file)
+    except Exception:
+        pass
+
+def get_query_types(excel_file=None):
+    """Load query types from the shared tracker first, then local config, then defaults."""
+    if excel_file:
+        shared = load_shared_settings(excel_file)
+        if shared.get("query_types"):
+            return shared["query_types"]
+    cfg = load_config()
     return cfg.get("query_types", list(DEFAULT_QUERY_TYPES))
 
-def get_team_members():
-    """Load team members from config."""
-    cfg=load_config()
+def get_team_members(excel_file=None):
+    """Load team members from the shared tracker first, then local config."""
+    if excel_file:
+        shared = load_shared_settings(excel_file)
+        if shared.get("team_members"):
+            return shared["team_members"]
+    cfg = load_config()
     return cfg.get("team_members", [])
 
-# Initialise from config — may be overridden again in _launch
+# Initialise from config — will be overridden in _launch once excel_file is known
 QUERY_TYPES[:] = get_query_types()
 
 def save_config(cfg):
@@ -1505,8 +1561,12 @@ class SetupWizard(tk.Toplevel):
         qt_frame=self._tab_frames["query_types"]
         qt_body=tk.Frame(qt_frame,bg=BG,padx=24,pady=16); qt_body.pack(fill="both",expand=True)
         tk.Label(qt_body,text="Manage query types",font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w")
-        tk.Label(qt_body,text="Add, rename or remove types. Removing a type won't affect existing queries.",
-                 font=(FONT,9),bg=BG,fg=TEXT2,wraplength=540,justify="left").pack(anchor="w",pady=(4,12))
+        tk.Label(qt_body,text="Add, rename or remove types. Changes are saved to the shared tracker so all teammates see the same list automatically.",
+                 font=(FONT,9),bg=BG,fg=TEXT2,wraplength=540,justify="left").pack(anchor="w",pady=(4,4))
+        sync_note=tk.Frame(qt_body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=6)
+        sync_note.pack(fill="x",pady=(0,10))
+        tk.Label(sync_note,text="🔄  Shared — any changes you save here will be picked up by all teammates within 30 seconds.",
+                 font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left").pack(anchor="w")
 
         list_frame=tk.Frame(qt_body,bg=CARD2,highlightthickness=1,highlightbackground=BORDER)
         list_frame.pack(fill="both",expand=True,pady=(0,10))
@@ -1517,7 +1577,9 @@ class SetupWizard(tk.Toplevel):
         lb.configure(yscrollcommand=lb_sb.set)
         lb_sb.pack(side="right",fill="y"); lb.pack(fill="both",expand=True,padx=4,pady=4)
 
-        current_types=list(self.cfg.get("query_types",DEFAULT_QUERY_TYPES))
+        # Seed from the shared tracker if available, otherwise local config
+        _shared_qt=load_shared_settings(self.cfg.get("excel_file",""))
+        current_types=list(_shared_qt.get("query_types") or self.cfg.get("query_types",DEFAULT_QUERY_TYPES))
         def refresh_lb():
             lb.delete(0,"end")
             for t in current_types: lb.insert("end",f"  {t}")
@@ -1976,6 +2038,9 @@ class SetupWizard(tk.Toplevel):
             "theme":          chosen_theme,
         })
         save_config(self.cfg)
+        # Also write query types and team members to the shared tracker so all
+        # teammates pick them up automatically on next reload.
+        save_shared_settings(excel, self._current_types, self._current_members)
         global QUERY_TYPES
         QUERY_TYPES[:] = self._current_types
         theme_changed=(chosen_theme!=ACTIVE_THEME)
@@ -2157,8 +2222,11 @@ class QueryTrackerApp(tk.Tk):
         self.username=self.cfg.get("username","Unknown")
         self.excel_file=self.cfg.get("excel_file","")
         self.sites_file=self.cfg.get("sites_file","")
-        QUERY_TYPES[:]=self.cfg.get("query_types",DEFAULT_QUERY_TYPES)
-        self.team_members=self.cfg.get("team_members",[])
+        # Load query types and team members from the shared tracker so all
+        # teammates automatically pick up any changes made by others.
+        shared=load_shared_settings(self.excel_file)
+        QUERY_TYPES[:]=shared.get("query_types") or self.cfg.get("query_types",DEFAULT_QUERY_TYPES)
+        self.team_members=shared.get("team_members") or self.cfg.get("team_members",[])
         self.linked_trackers=self.cfg.get("linked_trackers",[])
         self.out_of_office=self._normalize_out_of_office(self.cfg.get("out_of_office",[]))
         self._assignee_filter=""
@@ -4310,6 +4378,12 @@ class QueryTrackerApp(tk.Tk):
                 self._excel_mtime=self._get_excel_mtime()
                 self._dash_dirty=True
                 self._rpt_dirty=True
+                # Re-read shared query types / team members in case another user updated them
+                shared=load_shared_settings(self.excel_file)
+                if shared.get("query_types"):
+                    QUERY_TYPES[:]=shared["query_types"]
+                if shared.get("team_members"):
+                    self.team_members=shared["team_members"]
                 self._refresh_table()
                 self._show_daily_banner()
                 # Check for incoming transfer notifications on every reload
