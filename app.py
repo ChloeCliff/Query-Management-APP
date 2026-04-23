@@ -214,7 +214,22 @@ def _setup_dnd(toplevel, callback):
         print(f"DnD setup failed: {e}")
         return False
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Directory the exe (or script) lives in — used for all relative paths
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
+# Default data paths — created automatically so the team never has to browse
+DEFAULT_DATA_DIR    = os.path.join(APP_DIR, "Data")
+DEFAULT_EXCEL_FILE  = os.path.join(DEFAULT_DATA_DIR, "query_tracker.xlsx")
+DEFAULT_BACKUP_DIR  = os.path.join(DEFAULT_DATA_DIR, "Backups")
+DEFAULT_ATTACH_DIR  = os.path.join(APP_DIR, "ATTACHMENTS")
+
+def _ensure_app_folders():
+    """Create Data/, Data/Backups/, and ATTACHMENTS/ next to the exe on first run."""
+    for folder in (DEFAULT_DATA_DIR, DEFAULT_BACKUP_DIR, DEFAULT_ATTACH_DIR):
+        os.makedirs(folder, exist_ok=True)
+
+_ensure_app_folders()
 
 DEFAULT_QUERY_TYPES = [
     "Sub-Meter reads","Tenancy change","Recharge rework","New instruction",
@@ -1370,8 +1385,12 @@ class SetupWizard(tk.Toplevel):
             make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
             return var
 
+        # Pre-fill with the default path (Data\query_tracker.xlsx next to the exe)
+        # so team members on SharePoint don't need to browse — just confirm and go.
+        if not self.cfg.get("excel_file"):
+            self.cfg["excel_file"] = DEFAULT_EXCEL_FILE
         self.excel_var=path_row("Query data file",
-            "Where to save query_tracker.xlsx — use your shared OneDrive folder.","excel_file",save_mode=True)
+            "Pre-filled to Data\\query_tracker.xlsx next to the app. Change only if you use a different location.","excel_file",save_mode=True)
         self.sites_var=path_row("Site list (sites.xlsx)",
             "Point to your sites.xlsx in the same shared folder.","sites_file")
 
