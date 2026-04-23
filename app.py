@@ -1169,8 +1169,20 @@ def _safe_folder_name(s):
     return s.strip()[:60] or "Unknown"
 
 def get_attachments_root(sites_file):
-    if not sites_file: return None
-    return os.path.join(os.path.dirname(sites_file),"Attachments")
+    app_level = os.path.join(APP_DIR, "ATTACHMENTS")
+    if os.path.exists(app_level):
+        return app_level
+    app_level_legacy = os.path.join(APP_DIR, "Attachments")
+    if os.path.exists(app_level_legacy):
+        return app_level_legacy
+    if not sites_file:
+        return app_level
+    parent = os.path.dirname(sites_file)
+    for nm in ("ATTACHMENTS", "Attachments"):
+        cand = os.path.join(parent, nm)
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(parent, "ATTACHMENTS")
 
 def get_attachment_folder(sites_file, q, create=True):
     # SharePoint URLs cannot be used for local file operations - return None gracefully
@@ -1213,6 +1225,17 @@ def list_attachments(sites_file, q):
             for f in sorted(os.listdir(legacy)):
                 fp=os.path.join(legacy,f)
                 if os.path.isfile(fp): files.append((f,fp))
+
+    if not files:
+        root=get_attachments_root(sites_file)
+        ref=_safe_folder_name(q.get("ref","Unknown"))
+        if root and os.path.exists(root):
+            for dpath, _, fnames in os.walk(root):
+                if os.path.basename(dpath)==ref:
+                    for f in sorted(fnames):
+                        fp=os.path.join(dpath,f)
+                        if os.path.isfile(fp): files.append((f,fp))
+                    break
 
     return files
 
@@ -1670,7 +1693,8 @@ class SetupWizard(tk.Toplevel):
         tm_lb.configure(yscrollcommand=tm_sb.set)
         tm_sb.pack(side="right",fill="y"); tm_lb.pack(fill="both",expand=True,padx=4,pady=4)
 
-        current_members=list(self.cfg.get("team_members",[]))
+        _shared_tm=load_shared_settings(self.cfg.get("excel_file",""))
+        current_members=list(_shared_tm.get("team_members") or self.cfg.get("team_members",[]))
         def refresh_tm_lb():
             tm_lb.delete(0,"end")
             for m in current_members: tm_lb.insert("end",f"  {m}")
@@ -2165,7 +2189,7 @@ class QueryTrackerApp(tk.Tk):
         pri_counts = {}
         t=today_str()
         due=[q for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=t]
-        mine=[q for q in due if q.get("assigned_to","")==self.username]
+        mine=[q for q in due if self._is_my_assignment(q.get("assigned_to",""))]
         
         for pri in priorities:
             pri_counts[pri] = len([q for q in mine if q.get("priority", "Low") == pri])
@@ -2206,7 +2230,7 @@ class QueryTrackerApp(tk.Tk):
             
             t=today_str()
             due=[q for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=t]
-            mine=[q for q in due if q.get("assigned_to","")==self.username]
+            mine=[q for q in due if self._is_my_assignment(q.get("assigned_to",""))]
             
             priorities = ["High", "Medium", "Low"]
             pri_counts = {}
@@ -2259,6 +2283,7 @@ class QueryTrackerApp(tk.Tk):
     def _launch(self):
         global QUERY_TYPES
         self.username=self.cfg.get("username","Unknown")
+        self.login_name=(os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
         self.excel_file=self.cfg.get("excel_file","")
         self.sites_file=self.cfg.get("sites_file","")
         # Load query types and team members from the shared tracker so all
@@ -2298,6 +2323,21 @@ class QueryTrackerApp(tk.Tk):
         try: self.sync_lbl.config(text="● Live")
         except: pass
         self.after(1200,self._check_notifications)  # slight delay so UI is fully drawn
+
+    def _is_my_assignment(self, assigned_to):
+        a=(assigned_to or "").strip().lower()
+        if not a:
+            return False
+        nm=(self.username or "").strip().lower()
+        lg=(getattr(self,"login_name","") or "").strip().lower()
+        if a==nm or (lg and a==lg):
+            return True
+        if "(" in a and a.endswith(")"):
+            inner=a[a.rfind("(")+1:-1].strip()
+            lead=a[:a.rfind("(")].strip()
+            if inner in (nm,lg) or lead in (nm,lg):
+                return True
+        return False
 
     def _build_ui(self):
         # ── Top navigation bar ────────────────────────────────────────────────
@@ -3143,52 +3183,7 @@ class QueryTrackerApp(tk.Tk):
                     self._refresh_dashboard(); self._refresh_table()
                 make_btn(tm_row,"✕ Clear person filter",clear_pf,"danger",padx=10,pady=6).pack(side="left",padx=(4,0))
 
-        # ── Workload Balancing ────────────────────────────────────────────────
-        all_members = list(dict.fromkeys([self.username] + self.team_members))
-        if len(all_members) > 1:  # Only show if there are multiple team members
-            self._section_lbl(dp, "WORKLOAD BALANCE")
-            wl_frame = tk.Frame(dp, bg=BG)
-            wl_frame.pack(fill="x", pady=(0, 4))
-            
-            # Calculate workload stats
-            member_stats = []
-            total_open = 0
-            total_action = 0
-            
-            for person in all_members:
-                pqs = [q for q in filtered_queries if q.get("assigned_to", "") == person]
-                p_open = sum(1 for q in pqs if q["status"] != "Resolved")
-                p_action = sum(1 for q in pqs if q["status"] != "Resolved" 
-                              and q.get("chase_date", "") and q["chase_date"] <= today)
-                member_stats.append((person, p_open, p_action))
-                total_open += p_open
-                total_action += p_action
-            
-            # Calculate averages
-            avg_open = total_open / len(all_members) if all_members else 0
-            avg_action = total_action / len(all_members) if all_members else 0
-            
-            # Show workload distribution
-            for person, p_open, p_action in member_stats:
-                workload_level = "low" if p_open < avg_open * 0.8 else "high" if p_open > avg_open * 1.2 else "balanced"
-                bg_color = SUCCESS if workload_level == "balanced" else WARNING if workload_level == "high" else MUTED
-                
-                wl_card = tk.Frame(wl_frame, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-                wl_card.pack(side="left", padx=(0, 10))
-                tk.Frame(wl_card, bg=bg_color, width=3).pack(side="left", fill="y")
-                wl_inner = tk.Frame(wl_card, bg=CARD, padx=14, pady=10)
-                wl_inner.pack(side="left")
-                
-                tk.Label(wl_inner, text=person, font=(FONT, 9, "bold"), bg=CARD, fg=TEXT).pack(anchor="w")
-                wl_stats = tk.Frame(wl_inner, bg=CARD)
-                wl_stats.pack(anchor="w", pady=(4, 0))
-                
-                for lbl, val, col in [("open", p_open, ACCENT2), ("action", p_action, DANGER if p_action else MUTED)]:
-                    wl_sf = tk.Frame(wl_stats, bg=CARD)
-                    wl_sf.pack(side="left", padx=(0, 12))
-                    tk.Label(wl_sf, text=str(val), font=(FONT, 13, "bold"), bg=CARD, 
-                            fg=(DANGER if col == DANGER and val > 0 else col) if val > 0 else MUTED).pack(anchor="w")
-                    tk.Label(wl_sf, text=lbl, font=(FONT, 7), bg=CARD, fg=MUTED).pack(anchor="w")
+        # Workload Balance removed from dashboard by request (TEAM section already covers this).
 
         if recent_qs:
             self._section_lbl(dp,"RECENTLY OPENED")
@@ -4907,7 +4902,7 @@ class QueryTrackerApp(tk.Tk):
             return False
         return True
 
-    def _day_workload(self, day_str, exclude_ids=None):
+    def _day_workload(self, day_str, exclude_ids=None, assignee=None):
         if not parse_iso_date(day_str): return 0
         exclude_ids = set(exclude_ids or [])
         return sum(
@@ -4915,6 +4910,7 @@ class QueryTrackerApp(tk.Tk):
             if q.get("status") != "Resolved"
             and q.get("chase_date", "") == day_str
             and q.get("id") not in exclude_ids
+            and (assignee is None or q.get("assigned_to", "") == assignee)
         )
 
     def _get_high_volume_threshold(self):
@@ -4923,18 +4919,19 @@ class QueryTrackerApp(tk.Tk):
         except:
             return HIGH_VOLUME_DAY_THRESHOLD
 
-    def _confirm_high_volume_day(self, day_str, exclude_ids=None, add_count=1, parent=None):
+    def _confirm_high_volume_day(self, day_str, exclude_ids=None, add_count=1, parent=None, assignee=None):
         if not parse_iso_date(day_str):
             return True
         threshold = self._get_high_volume_threshold()
-        base_load = self._day_workload(day_str, exclude_ids=exclude_ids)
+        base_load = self._day_workload(day_str, exclude_ids=exclude_ids, assignee=assignee)
         projected = base_load + max(0, int(add_count))
         if projected < threshold:
             return True
         pretty = fmt_date(day_str)
+        target = assignee if assignee else "all assignees"
         return messagebox.askyesno(
             "High workload day",
-            f"{pretty} already has {base_load} open quer{'y' if base_load == 1 else 'ies'}.\n"
+            f"{pretty} already has {base_load} open quer{'y' if base_load == 1 else 'ies'} for {target}.\n"
             f"Adding this change would make {projected}.\n\n"
             "Do you still want to schedule it for this day?",
             parent=parent or self,
@@ -5273,7 +5270,8 @@ class QueryTrackerApp(tk.Tk):
         def on_complete(cfg):
             self.cfg=cfg; self.username=cfg.get("username","Unknown")
             self.excel_file=cfg.get("excel_file",""); self.sites_file=cfg.get("sites_file","")
-            raw=cfg.get("team_members",[])
+            shared=load_shared_settings(self.excel_file)
+            raw=shared.get("team_members") or cfg.get("team_members",[])
             self.team_members=raw if raw else [self.username]
             if self.username not in self.team_members:
                 self.team_members=[self.username]+self.team_members
@@ -5527,12 +5525,17 @@ class QueryTrackerApp(tk.Tk):
             lambda: _show_cal(
                 dlg,
                 chase_var,
-                get_day_load=lambda d: self._day_workload(d, exclude_ids=[edit_query.get("id")] if is_edit else None),
+                get_day_load=lambda d: self._day_workload(
+                    d,
+                    exclude_ids=[edit_query.get("id")] if is_edit else None,
+                    assignee=("" if assignee_var.get().strip()=="(Unassigned)" else assignee_var.get().strip()) if assignee_var.get().strip() else None,
+                ),
                 confirm_day_selection=lambda d: self._confirm_high_volume_day(
                     d,
                     exclude_ids=[edit_query.get("id")] if is_edit else None,
                     add_count=1,
                     parent=dlg,
+                    assignee=("" if assignee_var.get().strip()=="(Unassigned)" else assignee_var.get().strip()) if assignee_var.get().strip() else None,
                 ),
                 high_volume_threshold=self._get_high_volume_threshold(),
                 date_block_reason=self._action_date_block_reason,
@@ -5803,6 +5806,8 @@ class QueryTrackerApp(tk.Tk):
         def save():
             if not client_var.get().strip() or not type_var.get() or not desc_text.get("1.0","end").strip():
                 messagebox.showwarning("Required","Client, type and description are required.",parent=dlg); return
+            assignee=assignee_var.get().strip()
+            if assignee=="(Unassigned)": assignee=""
             if not self._validate_action_date(chase_var.get().strip(), parent=dlg):
                 return
             if not self._confirm_high_volume_day(
@@ -5810,12 +5815,11 @@ class QueryTrackerApp(tk.Tk):
                 exclude_ids=[edit_query.get("id")] if is_edit else None,
                 add_count=1,
                 parent=dlg,
+                assignee=assignee,
             ):
                 return
             client=client_var.get().strip()
             site=site_var.get().strip()
-            assignee=assignee_var.get().strip()
-            if assignee=="(Unassigned)": assignee=""
             raised=raised_var.get().strip()
 
             if is_edit:
@@ -6023,9 +6027,17 @@ class QueryTrackerApp(tk.Tk):
             lambda: _show_cal(
                 dlg,
                 chase_var,
-                get_day_load=lambda d: self._day_workload(d, exclude_ids=[q.get("id")]),
+                get_day_load=lambda d: self._day_workload(
+                    d,
+                    exclude_ids=[q.get("id")],
+                    assignee=("" if assignee_var_d.get().strip()=="(Unassigned)" else assignee_var_d.get().strip()) if assignee_var_d.get().strip() else None,
+                ),
                 confirm_day_selection=lambda d: self._confirm_high_volume_day(
-                    d, exclude_ids=[q.get("id")], add_count=1, parent=dlg
+                    d,
+                    exclude_ids=[q.get("id")],
+                    add_count=1,
+                    parent=dlg,
+                    assignee=("" if assignee_var_d.get().strip()=="(Unassigned)" else assignee_var_d.get().strip()) if assignee_var_d.get().strip() else None,
                 ),
                 high_volume_threshold=self._get_high_volume_threshold(),
                 date_block_reason=self._action_date_block_reason,
@@ -6386,7 +6398,9 @@ class QueryTrackerApp(tk.Tk):
             old_chase=live_q.get("chase_date","").strip()
             prev_last_date=live_q.get("last_date", "")
             new_chase=chase_var.get().strip()
-            if not self._confirm_high_volume_day(new_chase, exclude_ids=[live_q.get("id")], add_count=1, parent=dlg):
+            assignee=assignee_var_d.get().strip()
+            if assignee=="(Unassigned)": assignee=""
+            if not self._confirm_high_volume_day(new_chase, exclude_ids=[live_q.get("id")], add_count=1, parent=dlg, assignee=assignee):
                 return
             old_desc=(live_q.get("desc", "") or "").strip()
             new_desc=desc_box.get("1.0","end").strip()
@@ -6397,8 +6411,7 @@ class QueryTrackerApp(tk.Tk):
             live_q["status"]=status_var.get(); live_q["priority"]=priority_var.get()
             live_q["chase_date"]=new_chase; live_q["desc"]=new_desc
             live_q["last_by"]=self.username; live_q["last_date"]=today_str()
-            assignee=assignee_var_d.get().strip()
-            live_q["assigned_to"]="" if assignee=="(Unassigned)" else assignee
+            live_q["assigned_to"]=assignee
             if not is_type_changed_query:
                 live_q["raised_date"]=raised_var_d.get().strip()
             if pending_note:
