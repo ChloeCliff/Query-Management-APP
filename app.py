@@ -1990,6 +1990,7 @@ class SetupWizard(tk.Toplevel):
         tk.Frame(self,bg=BORDER,height=1).pack(fill="x",side="bottom")
         if existing_cfg:
             make_btn(btns,"Cancel",self.destroy,"default",padx=14,pady=7).pack(side="right",padx=(8,0))
+            make_btn(btns,"Apply",lambda:self._save(close_after=False),"default",padx=14,pady=7).pack(side="right",padx=(8,0))
         make_btn(btns,"Save & apply",self._save,"primary",padx=18,pady=7).pack(side="right")
 
     def _switch_stab(self,tab_id,init=False):
@@ -2012,7 +2013,7 @@ class SetupWizard(tk.Toplevel):
             else:
                 btn.configure(fg=NAV_MUTED,font=(FONT,10),bg=NAV2)
 
-    def _save(self):
+    def _save(self, close_after=True):
         excel=self.excel_var.get().strip(); name=self.name_var.get().strip()
         if not excel:
             messagebox.showwarning("Required","Please choose a location for the query data file.",parent=self); return
@@ -2044,8 +2045,11 @@ class SetupWizard(tk.Toplevel):
         global QUERY_TYPES
         QUERY_TYPES[:] = self._current_types
         theme_changed=(chosen_theme!=ACTIVE_THEME)
-        self.destroy()
-        if self.on_complete: self.on_complete(self.cfg)
+        if close_after:
+            self.destroy()
+            if self.on_complete: self.on_complete(self.cfg)
+        else:
+            messagebox.showinfo("Applied","Settings updated successfully.",parent=self)
         if theme_changed:
             messagebox.showinfo("Theme changed",
                 f"Theme set to '{chosen_theme}'.\n\nClose and reopen the app to apply the new theme fully.")
@@ -2245,6 +2249,7 @@ class QueryTrackerApp(tk.Tk):
         self._auto_reload_running=False
         self._auto_reload_thread=None
         self._excel_mtime=self._get_excel_mtime()
+        self._reload_tick=0
         self._build_ui(); self.deiconify()
         self._refresh_table(); self._show_daily_banner()
         self._start_auto_reload()
@@ -2458,6 +2463,7 @@ class QueryTrackerApp(tk.Tk):
         tk.Frame(lp,bg=BORDER,height=1).pack(fill="x",side="bottom")
         self.status_lbl=tk.Label(sbar,text="",font=(FONT,9),bg=NAV2,fg=MUTED,anchor="w",padx=16)
         self.status_lbl.pack(side="left")
+        make_btn(sbar,"↻ Sync now",self._sync_now,"default",padx=10,pady=4).pack(side="right",padx=(0,8))
         self.sync_lbl=tk.Label(sbar,text="",font=(FONT,8),bg=NAV2,fg=MUTED,anchor="e",padx=16)
         self.sync_lbl.pack(side="right")
 
@@ -4285,8 +4291,11 @@ class QueryTrackerApp(tk.Tk):
 
     def _get_excel_mtime(self):
         try:
-            return os.path.getmtime(self.excel_file) if self.excel_file and os.path.exists(self.excel_file) else 0
-        except: return 0
+            # Use both mtime and file size to improve change detection on synced files.
+            if not self.excel_file or not os.path.exists(self.excel_file):
+                return (0,0)
+            return (os.path.getmtime(self.excel_file), os.path.getsize(self.excel_file))
+        except: return (0,0)
 
     def _start_auto_reload(self):
         if self._auto_reload_running: return
@@ -4356,18 +4365,28 @@ class QueryTrackerApp(tk.Tk):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _auto_reload_loop(self):
-        """Poll the Excel file every 30 seconds; reload silently if it changed."""
+        """Poll the Excel file frequently; force periodic reloads to handle sync lag."""
         sleep_event=threading.Event()
         while self._auto_reload_running:
-            sleep_event.wait(30)
+            sleep_event.wait(10)
             sleep_event.clear()
             if not self._auto_reload_running: break
             try:
+                self._reload_tick += 1
                 new_mtime=self._get_excel_mtime()
-                if new_mtime and new_mtime!=self._excel_mtime:
+                # Also force a reload every 60 seconds in case SharePoint sync
+                # updates content without a detectable local timestamp bump.
+                if (new_mtime and new_mtime!=self._excel_mtime) or (self._reload_tick % 6 == 0):
                     self._excel_mtime=new_mtime
                     self.after(0,self._silent_reload)
             except: pass
+
+    def _sync_now(self):
+        """Manual on-demand refresh for users who need immediate updates."""
+        try:
+            self.sync_lbl.config(text="↻ Syncing...")
+        except: pass
+        self.after(0,self._silent_reload)
 
     def _silent_reload(self):
         """Reload queries from disk without disrupting any open dialogs."""
