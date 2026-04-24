@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-def _normalize_icon_png(png_file, size, padding_ratio=0.10):
+def _normalize_icon_png(png_file, size, padding_ratio=0.04, alpha_threshold=28):
     """Trim transparent margins, then center with consistent padding.
 
     This makes the icon fill the canvas like a typical Windows app icon.
@@ -13,7 +13,10 @@ def _normalize_icon_png(png_file, size, padding_ratio=0.10):
         from PIL import Image
         img = Image.open(png_file).convert("RGBA")
         alpha = img.split()[-1]
-        bbox = alpha.getbbox()
+        # Ignore very faint pixels so translucent decorative background doesn't
+        # make the icon appear smaller than typical Windows app icons.
+        mask = alpha.point(lambda p: 255 if p >= alpha_threshold else 0)
+        bbox = mask.getbbox()
         if bbox:
             img = img.crop(bbox)
 
