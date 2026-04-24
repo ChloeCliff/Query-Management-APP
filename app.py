@@ -2554,37 +2554,43 @@ class QueryTrackerApp(tk.Tk):
         self._show_page("dashboard",init=True)
 
     def _show_page(self,page,init=False):
+        if getattr(self, "_switching_page", False):
+            return
         if not init and getattr(self,"_current_page",None)==page:
             return
-        self._current_page=page
-        if page=="dashboard":
-            self.dashboard_page.tkraise()
-            if getattr(self,"_dash_dirty",True):
-                self.after_idle(self._refresh_dashboard)
-                self._dash_dirty=False
-        elif page=="calendar":
-            self.calendar_page.tkraise()
-            self.after_idle(self._refresh_calendar_page)
-        elif page=="reports":
-            self.reports_page.tkraise()
-            if getattr(self,"_rpt_dirty",True):
-                self.after_idle(self._refresh_reports)
-                self._rpt_dirty=False
-        else:
-            self.list_page.tkraise()
-            if not init:
-                self.after_idle(self._refresh_table)
-        # Watcher runs on ALL pages — drop inbox should work wherever you are
-        self._start_watcher()
-        for v,btn in self._page_btns.items():
-            if v==page:
-                btn.configure(fg=ACCENT2,font=(FONT,10,"bold"),bg=NAV2,
-                              highlightthickness=0)
-                # Underline effect via border bottom trick — pad bottom more
-                btn.configure(pady=9)
+        self._switching_page=True
+        try:
+            self._current_page=page
+            if page=="dashboard":
+                self.dashboard_page.tkraise()
+                if getattr(self,"_dash_dirty",True):
+                    self._refresh_dashboard()
+                    self._dash_dirty=False
+            elif page=="calendar":
+                self.calendar_page.tkraise()
+                self._refresh_calendar_page()
+            elif page=="reports":
+                self.reports_page.tkraise()
+                if getattr(self,"_rpt_dirty",True):
+                    self._refresh_reports()
+                    self._rpt_dirty=False
             else:
-                btn.configure(fg=NAV_MUTED,font=(FONT,10),bg=NAV2,pady=11,
-                              highlightthickness=0)
+                self.list_page.tkraise()
+                if not init:
+                    self._refresh_table()
+            # Watcher runs on ALL pages — drop inbox should work wherever you are
+            self._start_watcher()
+            for v,btn in self._page_btns.items():
+                if v==page:
+                    btn.configure(fg=ACCENT2,font=(FONT,10,"bold"),bg=NAV2,
+                                  highlightthickness=0)
+                    btn.configure(pady=9)
+                else:
+                    btn.configure(fg=NAV_MUTED,font=(FONT,10),bg=NAV2,pady=11,
+                                  highlightthickness=0)
+            self.update_idletasks()
+        finally:
+            self._switching_page=False
 
     def _section_lbl(self, parent, text):
         f=tk.Frame(parent,bg=BG); f.pack(fill="x",pady=(20,10))
@@ -3118,8 +3124,26 @@ class QueryTrackerApp(tk.Tk):
             af=getattr(self,"_assignee_filter","")
 
             def set_person_filter(person):
+                # Keep Query List state in sync so switching pages reflects the same person/action view.
+                def sync_list_filters(target_person):
+                    self.search_var.set("")
+                    try: self.filter_client.set("All")
+                    except: pass
+                    try: self.filter_fund.set("All")
+                    except: pass
+                    try: self.filter_type.set("All")
+                    except: pass
+                    try: self.filter_status.set("All")
+                    except: pass
+                    try: self.filter_utility.set("All")
+                    except: pass
+                    try: self.filter_assignee.set(target_person or "All")
+                    except: pass
+                    self._set_tab("action", refresh=False)
+
                 if getattr(self,"_assignee_filter","")==person:
                     self._assignee_filter=""  # toggle off — stay on dashboard
+                    sync_list_filters("")
                     try: self.filter_assignee.set("All")
                     except: pass
                     try: self.cal_member_var.set("All")
@@ -3129,6 +3153,7 @@ class QueryTrackerApp(tk.Tk):
                     self.after_idle(self._refresh_table)
                 else:
                     self._assignee_filter=person
+                    sync_list_filters(person)
                     try: self.filter_assignee.set(person)
                     except: pass
                     try: self.cal_member_var.set(person)
