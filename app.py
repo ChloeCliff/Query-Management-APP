@@ -1251,6 +1251,61 @@ def save_attachment(sites_file, q, src_path):
     shutil.copy2(src_path,dest)
     return os.path.basename(dest),dest
 
+def reorganize_attachments(sites_file, queries):
+    """Move legacy attachment files into the current Site/Utility/Type/Ref layout."""
+    stats = {"moved": 0, "errors": 0, "refs": 0}
+
+    if not sites_file or (sites_file.startswith("http://") or sites_file.startswith("https://")):
+        return stats
+
+    root = get_attachments_root(sites_file)
+    if not root or not os.path.exists(root):
+        return stats
+
+    ref_targets = {}
+    for q in queries or []:
+        ref_safe = _safe_folder_name(q.get("ref", "Unknown"))
+        if not ref_safe or ref_safe in ref_targets:
+            continue
+        target = get_attachment_folder(sites_file, q, create=True)
+        if target:
+            ref_targets[ref_safe] = os.path.abspath(target)
+
+    if not ref_targets:
+        return stats
+
+    move_plan = []
+    for dpath, _, fnames in os.walk(root):
+        ref_dir = os.path.basename(dpath)
+        if ref_dir not in ref_targets:
+            continue
+        target_dir = ref_targets[ref_dir]
+        if os.path.abspath(dpath) == target_dir:
+            continue
+        for fname in fnames:
+            src = os.path.join(dpath, fname)
+            if os.path.isfile(src):
+                move_plan.append((src, target_dir))
+
+    stats["refs"] = len({os.path.basename(os.path.dirname(src)) for src, _ in move_plan})
+
+    for src, target_dir in move_plan:
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            fname = os.path.basename(src)
+            dest = os.path.join(target_dir, fname)
+            base, ext = os.path.splitext(fname)
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(target_dir, f"{base}_{counter}{ext}")
+                counter += 1
+            shutil.move(src, dest)
+            stats["moved"] += 1
+        except Exception:
+            stats["errors"] += 1
+
+    return stats
+
 def open_file(path):
     try:
         if sys.platform=="win32": os.startfile(path)
@@ -2370,6 +2425,7 @@ class QueryTrackerApp(tk.Tk):
         tk.Label(left,text=self.username,font=(FONT,10),bg=NAV,fg=NAV_MUTED).pack(side="left")
         right=tk.Frame(inner_nav,bg=NAV); right.pack(side="right")
         make_btn(right,"⚙  Settings",self._open_settings,"nav",padx=11,pady=5).pack(side="right",padx=2)
+        make_btn(right,"🗂  Reorganise attachments",self._reorganize_existing_attachments,"nav",padx=11,pady=5).pack(side="right",padx=2)
         make_btn(right,"↻  Reload",self._reload_sites,"nav",padx=11,pady=5).pack(side="right",padx=2)
         make_btn(right,"□  Mini",self._toggle_mini_window,"nav",padx=11,pady=5).pack(side="right",padx=2)
         tk.Frame(right,bg=BORDER,width=1,height=24).pack(side="right",padx=10)
@@ -5334,6 +5390,37 @@ class QueryTrackerApp(tk.Tk):
         self.filter_client.configure(values=["All"]+self.clients)
         self.filter_fund.configure(values=["All"]); self.filter_fund.set("All")
         messagebox.showinfo("Reloaded",f"{len(self.clients)} clients · {sum(len(v) for v in self.sites_by_client.values())} sites loaded.")
+
+    def _reorganize_existing_attachments(self):
+        if not self.sites_file:
+            messagebox.showerror("No sites file", "Cannot find sites.xlsx. Check the path in Settings.", parent=self)
+            return
+        if self.sites_file.startswith("http://") or self.sites_file.startswith("https://"):
+            messagebox.showerror(
+                "SharePoint not supported",
+                "Sites file cannot be a SharePoint URL.\n\nUse a locally synced/mapped path in Settings first.",
+                parent=self,
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Reorganise attachments",
+            "This will move existing attachment files into the current folder structure\n"
+            "(Site/Utility/Type/Reference).\n\nContinue?",
+            parent=self,
+        ):
+            return
+
+        stats = reorganize_attachments(self.sites_file, self.queries)
+        msg = (
+            f"Moved {stats['moved']} file{'s' if stats['moved'] != 1 else ''} "
+            f"across {stats['refs']} ref folder{'s' if stats['refs'] != 1 else ''}."
+        )
+        if stats["errors"]:
+            msg += f"\n\n{stats['errors']} file{'s' if stats['errors'] != 1 else ''} could not be moved."
+
+        self._refresh_table()
+        messagebox.showinfo("Reorganisation complete", msg, parent=self)
 
     def _open_settings(self):
         def on_complete(cfg):
