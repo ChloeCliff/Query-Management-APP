@@ -4398,7 +4398,7 @@ class QueryTrackerApp(tk.Tk):
             sleep_event.clear()
 
     def _do_daily_backup(self, forced=False):
-        """Copy query_tracker.xlsx → Data/Backups/query_tracker_YYYY-MM-DD.xlsx.
+        """Copy query_tracker.xlsx → Data/Backups/query_tracker_latest.xlsx.
 
         forced=True: used on app close — always run even if we already backed
         up today, so the file contains this session's latest saves.
@@ -4413,21 +4413,10 @@ class QueryTrackerApp(tk.Tk):
             backup_dir = os.path.join(os.path.dirname(self.excel_file), "Backups")
             os.makedirs(backup_dir, exist_ok=True)
 
-            stamp = datetime.now().strftime("%Y-%m-%d")
-            dest = os.path.join(backup_dir, f"query_tracker_{stamp}.xlsx")
+            dest = os.path.join(backup_dir, "query_tracker_latest.xlsx")
             import shutil
             shutil.copy2(self.excel_file, dest)
             self._last_backup_date = today
-
-            # Prune backups older than 30 days
-            cutoff = datetime.now().timestamp() - 30 * 86400
-            for f in os.listdir(backup_dir):
-                fp = os.path.join(backup_dir, f)
-                try:
-                    if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
-                        os.remove(fp)
-                except Exception:
-                    pass
 
             if not forced:
                 self.after(0, lambda d=dest: _show_toast(self, f"Backup saved: {os.path.basename(d)}"))
