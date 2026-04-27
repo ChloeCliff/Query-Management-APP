@@ -2969,18 +2969,19 @@ class QueryTrackerApp(tk.Tk):
         today=today_str()
         threshold=self._get_high_volume_threshold()
 
+        # Pre-index queries by date for O(1) lookup instead of O(n) per day
+        queries_by_date={}
+        for q in self.queries:
+            if q.get("status")=="Resolved":
+                continue
+            if member_filter!="All" and q.get("assigned_to","")!=member_filter:
+                continue
+            d=parse_iso_date(q.get("chase_date",""))
+            if d:
+                queries_by_date.setdefault(d,[]).append(q)
+
         def queries_for_day(day_date):
-            out=[]
-            for q in self.queries:
-                if q.get("status")=="Resolved":
-                    continue
-                d=parse_iso_date(q.get("chase_date",""))
-                if not d or d!=day_date:
-                    continue
-                if member_filter!="All" and q.get("assigned_to","")!=member_filter:
-                    continue
-                out.append(q)
-            return out
+            return queries_by_date.get(day_date,[])
 
         def out_of_office_for_day(day_str):
             items=[]
