@@ -12,6 +12,12 @@ try:
 except ImportError:
     SpellChecker = None
 
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
 # ── Windows OLE drag-and-drop ─────────────────────────────────────────────────
 _dnd_targets = {}
 
@@ -2170,10 +2176,16 @@ class QueryTrackerApp(tk.Tk):
         
         # Set app icon
         try:
+            ico_path = resource_path("qbox.ico")
+            if sys.platform == "win32" and os.path.exists(ico_path):
+                try:
+                    self.iconbitmap(default=ico_path)
+                except Exception:
+                    pass
             icon_path = resource_path("qbox-icon-256.png")
             if os.path.exists(icon_path):
                 photo = tk.PhotoImage(file=icon_path)
-                self.iconphoto(False, photo)
+                self.iconphoto(True, photo)
                 self._icon = photo  # Keep reference to prevent garbage collection
         except Exception as e:
             pass  # Icon loading is optional
@@ -2362,6 +2374,8 @@ class QueryTrackerApp(tk.Tk):
         self._watcher_seen=set()
         # Attachment count cache: {query_id: int} — avoids per-row filesystem hits in _refresh_table
         self._att_count_cache={}
+        self._list_dirty=True
+        self._cal_refresh_after_id=None
         # Auto-reload state
         self._auto_reload_running=False
         self._auto_reload_thread=None
@@ -2404,21 +2418,23 @@ class QueryTrackerApp(tk.Tk):
         # Logo pill
         logo_pill=tk.Frame(left,bg=ACCENT,padx=8,pady=3); logo_pill.pack(side="left",padx=(0,12))
         logo_img=None
-        for icon_name in ["qbox-icon-64.png","qbox-icon-128.png","qbox-icon-256.png"]:
+        for icon_name in ["qbox-icon-64.png","qbox-icon-128.png","qbox-icon-256.png","qbox-icon-32.png"]:
             icon_path=resource_path(icon_name)
             if os.path.exists(icon_path):
                 try:
-                    logo_img=tk.PhotoImage(file=icon_path)
+                    if Image and ImageTk:
+                        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+                        im=Image.open(icon_path).convert("RGBA").resize((20,20), resample)
+                        logo_img=ImageTk.PhotoImage(im)
+                    else:
+                        logo_img=tk.PhotoImage(file=icon_path)
+                        logo_img=logo_img.subsample(max(1,logo_img.width()//20),max(1,logo_img.height()//20))
                     break
                 except Exception:
                     logo_img=None
         if logo_img:
-            try:
-                logo_img=logo_img.subsample(max(1,logo_img.width()//20),max(1,logo_img.height()//20))
-            except Exception:
-                pass
             self._brand_logo=logo_img
-            tk.Label(logo_pill,image=self._brand_logo,bg=ACCENT).pack(side="left")
+            tk.Label(logo_pill,image=self._brand_logo,bg=ACCENT).pack(side="left",pady=(0,1))
             tk.Label(logo_pill,text="QBOX",font=(FONT,10,"bold"),bg=ACCENT,fg=PRIMARY_FG,padx=6).pack(side="left")
         else:
             tk.Label(logo_pill,text="QBOX",font=(FONT,11,"bold"),bg=ACCENT,fg=PRIMARY_FG,pady=5,padx=8).pack()
@@ -2626,7 +2642,14 @@ class QueryTrackerApp(tk.Tk):
                     self._dash_dirty=False
             elif page=="calendar":
                 self.calendar_page.tkraise()
-                self._refresh_calendar_page()
+                self.update_idletasks()
+                if getattr(self,"_cal_refresh_after_id",None):
+                    try:
+                        self.after_cancel(self._cal_refresh_after_id)
+                    except Exception:
+                        pass
+                self.cal_hint_lbl.config(text="Loading calendar view...")
+                self._cal_refresh_after_id=self.after(1,self._refresh_calendar_page)
             elif page=="reports":
                 self.reports_page.tkraise()
                 if getattr(self,"_rpt_dirty",True):
@@ -2634,8 +2657,9 @@ class QueryTrackerApp(tk.Tk):
                     self._rpt_dirty=False
             else:
                 self.list_page.tkraise()
-                if not init:
+                if not init and getattr(self,"_list_dirty",True):
                     self._refresh_table()
+                    self._show_daily_banner()
             # Watcher runs on ALL pages — drop inbox should work wherever you are
             self._start_watcher()
             for v,btn in self._page_btns.items():
@@ -2911,6 +2935,7 @@ class QueryTrackerApp(tk.Tk):
 
     def _refresh_calendar_page(self):
         import calendar as _cal
+        self._cal_refresh_after_id=None
         for w in self.cal_grid.winfo_children(): w.destroy()
 
         cal_palette={
@@ -2985,16 +3010,19 @@ class QueryTrackerApp(tk.Tk):
         def queries_for_day(day_date):
             return queries_by_date.get(day_date,[])
 
-        def out_of_office_for_day(day_str):
-            items=[]
-            for entry in getattr(self,"out_of_office",[]):
-                if entry.get("date")!=day_str:
-                    continue
-                if member_filter!="All" and entry.get("member")!=member_filter:
-                    continue
-                items.append(entry)
+        out_of_office_by_date={}
+        for entry in getattr(self,"out_of_office",[]):
+            day=entry.get("date","")
+            if not day:
+                continue
+            if member_filter!="All" and entry.get("member")!=member_filter:
+                continue
+            out_of_office_by_date.setdefault(day,[]).append(entry)
+        for items in out_of_office_by_date.values():
             items.sort(key=lambda x:(x.get("member",""),x.get("type",""),x.get("note","")))
-            return items
+
+        def out_of_office_for_day(day_str):
+            return out_of_office_by_date.get(day_str,[])
 
         if view=="week":
             day_cells=[week_start+timedelta(days=i) for i in range(7)]
@@ -4532,16 +4560,20 @@ class QueryTrackerApp(tk.Tk):
                     if w is not None:
                         try: _saved_filters[attr] = w.get()
                         except Exception: pass
-                self._refresh_table()
-                # Restore any filter that was unexpectedly cleared
-                for attr, val in _saved_filters.items():
-                    w = getattr(self, attr, None)
-                    if w is not None:
-                        try:
-                            if w.get() != val:
-                                w.set(val)
-                        except Exception: pass
-                self._show_daily_banner()
+                if getattr(self,"_current_page","")=="list":
+                    self._refresh_table()
+                    # Restore any filter that was unexpectedly cleared
+                    for attr, val in _saved_filters.items():
+                        w = getattr(self, attr, None)
+                        if w is not None:
+                            try:
+                                if w.get() != val:
+                                    w.set(val)
+                            except Exception:
+                                pass
+                    self._show_daily_banner()
+                else:
+                    self._list_dirty=True
                 # Check for incoming transfer notifications on every reload
                 self.after(200,self._check_notifications)
                 # Refresh mini window if open
@@ -4870,6 +4902,7 @@ class QueryTrackerApp(tk.Tk):
         af_txt=f"  ·  Assigned to: {af}" if af else ""
         df_txt=f"  ·  Action date: {fmt_date(df)}" if df else ""
         self.status_lbl.config(text=f"{n} of {len(self.queries)} queries shown{af_txt}{df_txt}  ·  Double-click to open  ·  {self.excel_file or 'No file configured'}")
+        self._list_dirty=False
 
     def _refresh_metrics(self):
         for w in self.metrics_frame.winfo_children(): w.destroy()
@@ -5349,6 +5382,7 @@ class QueryTrackerApp(tk.Tk):
         self._save_pending=True
         self._dash_dirty=True
         self._rpt_dirty=True
+        self._list_dirty=True
         self._flush_save_queue()
         return True
 
