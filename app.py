@@ -2360,6 +2360,8 @@ class QueryTrackerApp(tk.Tk):
         self._watcher_running=False
         self._watcher_thread=None
         self._watcher_seen=set()
+        # Attachment count cache: {query_id: int} — avoids per-row filesystem hits in _refresh_table
+        self._att_count_cache={}
         # Auto-reload state
         self._auto_reload_running=False
         self._auto_reload_thread=None
@@ -4649,6 +4651,7 @@ class QueryTrackerApp(tk.Tk):
             dest_name, dest = save_attachment(self.sites_file, q, fpath)
             if dest_name:
                 os.remove(fpath)
+                self._att_count_cache.pop(q.get("id",""),None)
                 q["log"] += " | " + stamp(self.username) + f" Auto-filed attachment: {dest_name}"
                 self._save_queries()
                 self._refresh_table()
@@ -4850,7 +4853,10 @@ class QueryTrackerApp(tk.Tk):
             elif q["status"]=="In Progress":     tag="in_prog"
             elif q["priority"]=="High":          tag="high"
             else:                                tag="open"
-            att_count=len(list_attachments(self.sites_file,q))
+            qid=q.get("id","")
+            if qid not in self._att_count_cache:
+                self._att_count_cache[qid]=len(list_attachments(self.sites_file,q))
+            att_count=self._att_count_cache[qid]
             att_disp=f"📎{att_count}" if att_count else ""
             raised_disp=fmt_date(q.get("raised_date","")) if q.get("raised_date") else "—"
             self.tree.insert("","end",iid=q["id"],
@@ -6372,6 +6378,7 @@ class QueryTrackerApp(tk.Tk):
                             parent=dlg):
                             try: os.remove(fp)
                             except Exception as e: messagebox.showerror("Error",str(e),parent=dlg); return
+                            self._att_count_cache.pop(q.get("id",""),None)
                             q["log"]+=" | "+stamp(self.username)+f" Removed attachment: {fn}"
                             refresh_attachments(); refresh_log()
                     make_btn(row,"✕",rm,"danger",padx=6,pady=2).pack(side="right",padx=(4,0))
@@ -6412,6 +6419,7 @@ class QueryTrackerApp(tk.Tk):
                 fname,dest=save_attachment(self.sites_file,q,p)
                 if fname: added.append(fname)
             if added:
+                self._att_count_cache.pop(q.get("id",""),None)
                 note=f"Added attachment{'s' if len(added)>1 else ''}: {', '.join(added)}"
                 q["log"]+=" | "+stamp(self.username)+" "+note
                 refresh_attachments(); refresh_log()
