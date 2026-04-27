@@ -4476,7 +4476,23 @@ class QueryTrackerApp(tk.Tk):
                     QUERY_TYPES[:]=shared["query_types"]
                 if shared.get("team_members"):
                     self.team_members=shared["team_members"]
+                # Preserve filter state before refresh so background sync never clears user filters
+                _saved_filters = {}
+                for attr in ("search_var","filter_client","filter_fund","filter_type",
+                             "filter_status","filter_utility","filter_assignee"):
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        try: _saved_filters[attr] = w.get()
+                        except Exception: pass
                 self._refresh_table()
+                # Restore any filter that was unexpectedly cleared
+                for attr, val in _saved_filters.items():
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        try:
+                            if w.get() != val:
+                                w.set(val)
+                        except Exception: pass
                 self._show_daily_banner()
                 # Check for incoming transfer notifications on every reload
                 self.after(200,self._check_notifications)
@@ -4528,10 +4544,20 @@ class QueryTrackerApp(tk.Tk):
                     for fname in sorted(new_files):
                         fpath = os.path.join(inbox, fname)
                         if not os.path.isfile(fpath): continue
+                        # Skip claim-in-progress sentinel files made by other instances
+                        if fname.endswith(".qbclaim"): continue
                         # Wait until file is fully written (size stable for 0.5s)
                         if not self._wait_for_file_ready(fpath): continue
+                        # ── Atomic claim: rename before any other instance can ──
+                        claimed_path = fpath + ".qbclaim"
+                        try:
+                            os.rename(fpath, claimed_path)
+                        except (FileNotFoundError, PermissionError, OSError):
+                            # Another app instance already claimed or deleted it
+                            self._watcher_seen.add(fname)
+                            continue
                         self._watcher_seen.add(fname)
-                        self.after(0, lambda f=fpath, n=fname:
+                        self.after(0, lambda f=claimed_path, n=fname:
                                    self._process_inbox_file(f, n))
             except: pass
             reuse_event.wait(2)
@@ -4560,14 +4586,16 @@ class QueryTrackerApp(tk.Tk):
 
     def _process_inbox_file(self, fpath, fname):
         if not os.path.exists(fpath): return
+        # Strip .qbclaim suffix for display/matching purposes
+        display_name = fname[:-len(".qbclaim")] if fname.endswith(".qbclaim") else fname
         # Immediate toast so user always knows something landed
-        _show_toast(self, f"📎  File dropped: {fname[:50]}", color="#1A2E48", duration=3000)
-        q = extract_ref_from_filename(fname, self.queries)
+        _show_toast(self, f"📎  File dropped: {display_name[:50]}", color="#1A2E48", duration=3000)
+        q = extract_ref_from_filename(display_name, self.queries)
         if q:
-            self._file_to_query(fpath, fname, q)
+            self._file_to_query(fpath, display_name, q)
         else:
             # Small delay lets any active grab settle before showing dialog
-            self.after(500, lambda: self._ask_assign_query(fpath, fname))
+            self.after(500, lambda: self._ask_assign_query(fpath, display_name))
 
 
     def _file_to_query(self, fpath, fname, q):
@@ -4581,9 +4609,25 @@ class QueryTrackerApp(tk.Tk):
                 _show_toast(self,
                     f"✓  Filed under {q['ref']}\n{dest_name}",
                     color=SUCCESS, duration=4000)
+            else:
+                # save_attachment returned None (e.g. no attachment folder configured) —
+                # move claim file to _UNMATCHED so it isn't lost
+                try:
+                    um = os.path.join(os.path.dirname(fpath), "_UNMATCHED")
+                    os.makedirs(um, exist_ok=True)
+                    shutil.move(fpath, os.path.join(um, fname))
+                except Exception:
+                    pass
         except Exception as e:
             _show_toast(self, f"⚠  Could not file {fname}:\n{e}",
                         color=DANGER, duration=5000)
+            # Clean up the claim file so it doesn't block the folder
+            try:
+                um = os.path.join(os.path.dirname(fpath), "_UNMATCHED")
+                os.makedirs(um, exist_ok=True)
+                shutil.move(fpath, os.path.join(um, fname))
+            except Exception:
+                pass
 
     def _ask_assign_query(self, fpath, fname):
         if not os.path.exists(fpath): return
