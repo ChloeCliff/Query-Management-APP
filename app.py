@@ -1160,11 +1160,40 @@ def scrollable_frame(parent):
     inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>",lambda e:canvas.itemconfig(win,width=e.width))
 
+    wheel_active={"on":False}
+
     def _scroll(e):
-        canvas.yview_scroll(int(-1*(e.delta/120)),"units")
-        return "break"
-    canvas.bind("<MouseWheel>",_scroll)
-    inner.bind("<MouseWheel>",_scroll)
+        if not wheel_active["on"]:
+            return
+        try:
+            delta=0
+            if getattr(e,"num",None)==4:
+                delta=-1
+            elif getattr(e,"num",None)==5:
+                delta=1
+            elif getattr(e,"delta",0):
+                delta=int(-1*(e.delta/120))
+            if delta:
+                canvas.yview_scroll(delta,"units")
+                return "break"
+        except Exception:
+            pass
+
+    def _activate_wheel(_e=None):
+        wheel_active["on"]=True
+
+    def _deactivate_wheel(_e=None):
+        wheel_active["on"]=False
+
+    canvas.bind("<Enter>",_activate_wheel)
+    inner.bind("<Enter>",_activate_wheel)
+    canvas.bind("<Leave>",_deactivate_wheel)
+    inner.bind("<Leave>",_deactivate_wheel)
+
+    # Bind globally once per scrollable frame; only the active frame consumes wheel events.
+    canvas.bind_all("<MouseWheel>",_scroll,add="+")
+    canvas.bind_all("<Button-4>",_scroll,add="+")
+    canvas.bind_all("<Button-5>",_scroll,add="+")
     return inner,canvas
 
 def _safe_folder_name(s):
