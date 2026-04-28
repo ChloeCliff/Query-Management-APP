@@ -1160,14 +1160,11 @@ def scrollable_frame(parent):
     inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>",lambda e:canvas.itemconfig(win,width=e.width))
 
-    def _scroll(e): canvas.yview_scroll(int(-1*(e.delta/120)),"units")
+    def _scroll(e):
+        canvas.yview_scroll(int(-1*(e.delta/120)),"units")
+        return "break"
     canvas.bind("<MouseWheel>",_scroll)
     inner.bind("<MouseWheel>",_scroll)
-    def _bind_children(widget):
-        widget.bind("<MouseWheel>",_scroll)
-        for child in widget.winfo_children(): _bind_children(child)
-    inner.bind("<Configure>",lambda e:(_bind_children(inner),
-                                        canvas.configure(scrollregion=canvas.bbox("all"))),add="+")
     return inner,canvas
 
 def _safe_folder_name(s):
@@ -2375,7 +2372,9 @@ class QueryTrackerApp(tk.Tk):
         # Attachment count cache: {query_id: int} — avoids per-row filesystem hits in _refresh_table
         self._att_count_cache={}
         self._list_dirty=True
+        self._metrics_dirty=True
         self._cal_refresh_after_id=None
+        self._list_refresh_after_id=None
         # Auto-reload state
         self._auto_reload_running=False
         self._auto_reload_thread=None
@@ -2418,14 +2417,17 @@ class QueryTrackerApp(tk.Tk):
         # Logo pill
         logo_pill=tk.Frame(left,bg=ACCENT,padx=8,pady=3); logo_pill.pack(side="left",padx=(0,12))
         logo_img=None
-        for icon_name in ["qbox-icon-64.png","qbox-icon-128.png","qbox-icon-256.png","qbox-icon-32.png"]:
+        for icon_name in ["qbox-icon-32.png","qbox-icon-64.png","qbox-icon-128.png","qbox-icon-256.png"]:
             icon_path=resource_path(icon_name)
             if os.path.exists(icon_path):
                 try:
                     if Image and ImageTk:
                         resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
-                        im=Image.open(icon_path).convert("RGBA").resize((20,20), resample)
-                        logo_img=ImageTk.PhotoImage(im)
+                        src=Image.open(icon_path).convert("RGBA")
+                        im=src.resize((18,18), resample)
+                        badge=Image.new("RGBA", (20,20), (0,0,0,0))
+                        badge.alpha_composite(im, (1,0))
+                        logo_img=ImageTk.PhotoImage(badge)
                     else:
                         logo_img=tk.PhotoImage(file=icon_path)
                         logo_img=logo_img.subsample(max(1,logo_img.width()//20),max(1,logo_img.height()//20))
@@ -2505,7 +2507,7 @@ class QueryTrackerApp(tk.Tk):
         sc=tk.Frame(sc_wrap,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); sc.pack()
         tk.Label(sc,text="🔍",font=(FONT,10),bg=CARD2,fg=MUTED).pack(side="left",padx=(8,0))
         self.search_var=tk.StringVar()
-        self.search_var.trace_add("write",lambda *_:self._refresh_table())
+        self.search_var.trace_add("write",lambda *_:self._schedule_list_refresh())
         tk.Entry(sc,textvariable=self.search_var,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,relief="flat",bd=6,width=22,highlightthickness=0).pack(side="left")
 
         self.filter_client=_lbl_combo(frow_top,"CLIENT",
@@ -2518,26 +2520,26 @@ class QueryTrackerApp(tk.Tk):
         def on_filter_client(e=None):
             c=self.filter_client.get()
             funds=self.funds_by_client.get(c,[]) if c!="All" else sorted({f for fl in self.funds_by_client.values() for f in fl})
-            self.filter_fund.configure(values=["All"]+funds); self.filter_fund.set("All"); self._refresh_table()
+            self.filter_fund.configure(values=["All"]+funds); self.filter_fund.set("All"); self._schedule_list_refresh(0)
         self.filter_client.bind("<<ComboboxSelected>>",on_filter_client)
-        self.filter_fund.bind("<<ComboboxSelected>>",lambda _:self._refresh_table())
+        self.filter_fund.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
 
         self.filter_type=_lbl_combo(frow_top,"TYPE",
             lambda p: make_combo(p,tk.StringVar(),["All"]+QUERY_TYPES,readonly=True,width=20))
-        self.filter_type.set("All"); self.filter_type.bind("<<ComboboxSelected>>",lambda _:self._refresh_table())
+        self.filter_type.set("All"); self.filter_type.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
 
         self.filter_status=_lbl_combo(frow_bottom,"STATUS",
             lambda p: make_combo(p,tk.StringVar(),["All"]+STATUSES,readonly=True,width=13))
-        self.filter_status.set("All"); self.filter_status.bind("<<ComboboxSelected>>",lambda _:self._refresh_table())
+        self.filter_status.set("All"); self.filter_status.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
         all_utils=sorted({q.get("utility","") for q in self.queries if q.get("utility","")})
         self.filter_utility=_lbl_combo(frow_bottom,"UTILITY",
             lambda p: make_combo(p,tk.StringVar(),["All"]+all_utils,readonly=True,width=14),pad_right=12)
-        self.filter_utility.set("All"); self.filter_utility.bind("<<ComboboxSelected>>",lambda _:self._refresh_table())
+        self.filter_utility.set("All"); self.filter_utility.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
         all_members=list(dict.fromkeys([self.username]+self.team_members))
         self.filter_assignee=_lbl_combo(frow_bottom,"ASSIGNED TO",
             lambda p: make_combo(p,tk.StringVar(),["All"]+all_members,readonly=True,width=16))
         self.filter_assignee.set("All")
-        self.filter_assignee.bind("<<ComboboxSelected>>",lambda _:self._refresh_table())
+        self.filter_assignee.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
         btn_wrap=tk.Frame(frow_bottom,bg=BG); btn_wrap.pack(side="left",padx=(4,0))
         tk.Label(btn_wrap,text=" ",font=(FONT,7),bg=BG).pack()  # spacer to align buttons with combos
         make_btn(btn_wrap,"Clear",self._clear_filters,"default",padx=12,pady=6).pack(side="left")
@@ -2558,7 +2560,7 @@ class QueryTrackerApp(tk.Tk):
             swatch.pack_propagate(False)
             tk.Label(item,text=text,font=(FONT,8),bg=CARD2,fg=TEXT2).pack(side="left",padx=(5,0))
 
-        add_key_item(key_card,"Overdue",   "#2A1010", "#FCA5A5")
+        add_key_item(key_card,"Action today",   "#2A1010", "#FCA5A5")
         add_key_item(key_card,"Stale >30d", "#231600", "#FB923C")
         add_key_item(key_card,"Aging >14d", "#1E1900", "#FBBF24")
         add_key_item(key_card,"In Progress", "#0E1628", "#93C5FD")
@@ -2642,7 +2644,6 @@ class QueryTrackerApp(tk.Tk):
                     self._dash_dirty=False
             elif page=="calendar":
                 self.calendar_page.tkraise()
-                self.update_idletasks()
                 if getattr(self,"_cal_refresh_after_id",None):
                     try:
                         self.after_cancel(self._cal_refresh_after_id)
@@ -2670,9 +2671,36 @@ class QueryTrackerApp(tk.Tk):
                 else:
                     btn.configure(fg=NAV_MUTED,font=(FONT,10),bg=NAV2,pady=11,
                                   highlightthickness=0)
-            self.update_idletasks()
         finally:
             self._switching_page=False
+
+    def _app_has_focus(self):
+        try:
+            return self.focus_displayof() is not None
+        except Exception:
+            return False
+
+    def _schedule_list_refresh(self, delay_ms=120):
+        try:
+            if getattr(self,"_list_refresh_after_id",None):
+                self.after_cancel(self._list_refresh_after_id)
+        except Exception:
+            pass
+        self._list_refresh_after_id=self.after(delay_ms,self._run_scheduled_list_refresh)
+
+    def _run_scheduled_list_refresh(self):
+        self._list_refresh_after_id=None
+        if getattr(self,"_current_page","")!="list":
+            self._list_dirty=True
+            return
+        self._refresh_table()
+
+    def _refresh_list_if_visible(self):
+        if getattr(self,"_current_page","")=="list":
+            self._refresh_table()
+            self._show_daily_banner()
+        else:
+            self._list_dirty=True
 
     def _section_lbl(self, parent, text):
         f=tk.Frame(parent,bg=BG); f.pack(fill="x",pady=(20,10))
@@ -3195,7 +3223,7 @@ class QueryTrackerApp(tk.Tk):
             def run_escalation():
                 escalated = self._apply_escalation_rules()
                 self._refresh_dashboard()
-                self._refresh_table()
+                self._refresh_list_if_visible()
                 msg = f"Escalation complete. {escalated} quer{'y' if escalated == 1 else 'ies'} escalated." if escalated > 0 else "Escalation complete. No queries needed escalation."
                 messagebox.showinfo("Escalation Complete", msg, parent=self)
             make_btn(esc_actions, "⚡ Run Escalation", run_escalation, "warning", padx=12, pady=8).pack()
@@ -3237,7 +3265,7 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
                     self._dash_dirty=True
                     self.after_idle(self._refresh_dashboard)
-                    self.after_idle(self._refresh_table)
+                    self.after_idle(self._refresh_list_if_visible)
                 else:
                     self._assignee_filter=person
                     sync_list_filters(person)
@@ -3248,7 +3276,7 @@ class QueryTrackerApp(tk.Tk):
                     # Stay on dashboard and filter there instead of going to list
                     self._dash_dirty=True
                     self.after_idle(self._refresh_dashboard)
-                    self.after_idle(self._refresh_table)
+                    self.after_idle(self._refresh_list_if_visible)
 
             def _bind_click_tree(widget, on_click, on_enter, on_leave):
                 try:
@@ -3303,7 +3331,7 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
                     try: self.cal_member_var.set("All")
                     except: pass
-                    self.after_idle(self._refresh_dashboard); self.after_idle(self._refresh_table)
+                    self.after_idle(self._refresh_dashboard); self.after_idle(self._refresh_list_if_visible)
                 make_btn(tm_row,"✕ Clear person filter",clear_pf,"danger",padx=10,pady=6).pack(side="left",padx=(4,0))
 
         # Workload Balance removed from dashboard by request (TEAM section already covers this).
@@ -4546,6 +4574,7 @@ class QueryTrackerApp(tk.Tk):
                 self._excel_mtime=self._get_excel_mtime()
                 self._dash_dirty=True
                 self._rpt_dirty=True
+                self._metrics_dirty=True
                 # Re-read shared query types / team members in case another user updated them
                 shared=load_shared_settings(self.excel_file)
                 if shared.get("query_types"):
@@ -4560,7 +4589,13 @@ class QueryTrackerApp(tk.Tk):
                     if w is not None:
                         try: _saved_filters[attr] = w.get()
                         except Exception: pass
-                if getattr(self,"_current_page","")=="list":
+                focus_widget=None
+                try:
+                    focus_widget=self.focus_get()
+                except Exception:
+                    focus_widget=None
+                typing_widget=isinstance(focus_widget,(tk.Entry,ttk.Entry,ttk.Combobox)) if focus_widget else False
+                if getattr(self,"_current_page","")=="list" and self._app_has_focus() and not typing_widget:
                     self._refresh_table()
                     # Restore any filter that was unexpectedly cleared
                     for attr, val in _saved_filters.items():
@@ -4686,7 +4721,7 @@ class QueryTrackerApp(tk.Tk):
                 self._att_count_cache.pop(q.get("id",""),None)
                 q["log"] += " | " + stamp(self.username) + f" Auto-filed attachment: {dest_name}"
                 self._save_queries()
-                self._refresh_table()
+                self._refresh_list_if_visible()
                 _show_toast(self,
                     f"✓  Filed under {q['ref']}\n{dest_name}",
                     color=SUCCESS, duration=4000)
@@ -4797,7 +4832,7 @@ class QueryTrackerApp(tk.Tk):
                               highlightthickness=1,highlightbackground=BORDER)
             else:
                 btn.configure(fg=MUTED,font=(FONT,9),bg=BG,highlightthickness=0)
-        if refresh: self._refresh_table()
+        if refresh: self._schedule_list_refresh(0)
 
     def _copy_selected_rows(self, event=None):
         selected = self.tree.selection()
@@ -4853,8 +4888,9 @@ class QueryTrackerApp(tk.Tk):
         return result
 
     def _refresh_table(self):
+        filtered=self._get_filtered()
         self.tree.delete(*self.tree.get_children()); today=today_str()
-        for q in self._get_filtered():
+        for q in filtered:
             overdue=q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today
             if q["status"]=="Resolved": chase_disp="—"
             elif q.get("chase_date",""):
@@ -4895,8 +4931,10 @@ class QueryTrackerApp(tk.Tk):
                 values=(q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
                         q["type"],q["status"],q["priority"],overdue_disp,chase_disp,
                         raised_disp,fmt_date(q["opened"]),q.get("assigned_to",""),q.get("last_by",""),att_disp),tags=(tag,))
-        self._refresh_metrics()
-        n=len(self._get_filtered())
+        if getattr(self,"_metrics_dirty",True):
+            self._refresh_metrics()
+            self._metrics_dirty=False
+        n=len(filtered)
         af = getattr(self, "_assignee_filter", "")
         df = getattr(self, "_calendar_day_filter", "")
         af_txt=f"  ·  Assigned to: {af}" if af else ""
@@ -5126,7 +5164,7 @@ class QueryTrackerApp(tk.Tk):
         except: pass
         self._assignee_filter=""  # also clear person filter
         self._calendar_day_filter=""
-        if refresh: self._refresh_table()
+        if refresh: self._schedule_list_refresh(0)
 
     def _open_bulk_actions(self):
         """Open bulk actions dialog for selected queries."""
@@ -5383,6 +5421,7 @@ class QueryTrackerApp(tk.Tk):
         self._dash_dirty=True
         self._rpt_dirty=True
         self._list_dirty=True
+        self._metrics_dirty=True
         self._flush_save_queue()
         return True
 
