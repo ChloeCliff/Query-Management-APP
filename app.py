@@ -1005,7 +1005,26 @@ def _merge_queries_for_save(local_queries, excel_file):
 def save_all_queries(queries,excel_file):
     if not excel_file: return
     queries = _merge_queries_for_save(queries, excel_file)
-    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Queries"
+    if os.path.exists(excel_file):
+        try:
+            wb=openpyxl.load_workbook(excel_file)
+        except Exception:
+            wb=openpyxl.Workbook()
+    else:
+        wb=openpyxl.Workbook()
+
+    # Preserve all non-query sheets (e.g. _Notifications / shared settings)
+    # and regenerate only the data views managed by this app.
+    for sheet_name in ["Queries","Dashboard"]:
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames)==1:
+        try:
+            del wb["Sheet"]
+        except Exception:
+            pass
+
+    ws=wb.create_sheet("Queries",0)
     thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
     hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
     widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,30,20,20,28,14,18,14,18,12]
@@ -1030,7 +1049,7 @@ def save_all_queries(queries,excel_file):
         ws.cell(row=r,column=9).fill=PatternFill("solid",fgColor=sfills.get(q["status"],"FFFFFF"))
         ws.cell(row=r,column=10).fill=PatternFill("solid",fgColor=pfills.get(q["priority"],"FFFFFF"))
     ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:{get_column_letter(len(COLS))}1"
-    ds=wb.create_sheet("Dashboard"); ds.sheet_view.showGridLines=False
+    ds=wb.create_sheet("Dashboard",1); ds.sheet_view.showGridLines=False
     ds["A1"]="Query Tracker — Dashboard"
     ds["A1"].font=Font(bold=True,size=14,name=FONT,color="0F1B2D")
     ds["A2"]=f"Last updated: {date.today().strftime('%d/%m/%Y')}"
@@ -1045,7 +1064,9 @@ def save_all_queries(queries,excel_file):
         ds.cell(row=5,column=col,value=val).font=Font(name=FONT,size=18,bold=True,
             color="DC2626" if lbl=="Action today" and val>0 else "0F1B2D")
         ds.column_dimensions[get_column_letter(col)].width=18
-    wb.save(excel_file)
+    tmp=f"{excel_file}.tmp"
+    wb.save(tmp)
+    os.replace(tmp,excel_file)
 
 def apply_styles():
     style=ttk.Style(); style.theme_use("clam")
@@ -1160,12 +1181,26 @@ def scrollable_frame(parent):
     inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>",lambda e:canvas.itemconfig(win,width=e.width))
 
-    wheel_active={"on":False}
+    def _is_descendant(widget, ancestor):
+        w=widget
+        while w is not None:
+            if w==ancestor:
+                return True
+            w=getattr(w,"master",None)
+        return False
 
     def _scroll(e):
-        if not wheel_active["on"]:
-            return
         try:
+            # Let combobox fields/popup consume wheel events first.
+            if _ignore_combobox_wheel(e)=="break":
+                return "break"
+
+            pointed = canvas.winfo_containing(e.x_root, e.y_root)
+            if pointed is None:
+                return
+            if not (_is_descendant(pointed, inner) or _is_descendant(pointed, canvas)):
+                return
+
             delta=0
             if getattr(e,"num",None)==4:
                 delta=-1
@@ -1178,17 +1213,6 @@ def scrollable_frame(parent):
                 return "break"
         except Exception:
             pass
-
-    def _activate_wheel(_e=None):
-        wheel_active["on"]=True
-
-    def _deactivate_wheel(_e=None):
-        wheel_active["on"]=False
-
-    canvas.bind("<Enter>",_activate_wheel)
-    inner.bind("<Enter>",_activate_wheel)
-    canvas.bind("<Leave>",_deactivate_wheel)
-    inner.bind("<Leave>",_deactivate_wheel)
 
     # Bind globally once per scrollable frame; only the active frame consumes wheel events.
     canvas.bind_all("<MouseWheel>",_scroll,add="+")
@@ -5081,17 +5105,26 @@ class QueryTrackerApp(tk.Tk):
                      font=(FONT,9),bg=CARD2,fg=MUTED).pack(side="left")
 
             def mark_read():
+                if getattr(self,"_save_pending",False) or getattr(self,"_save_in_progress",False):
+                    self.after(1200, mark_read)
+                    return
                 try:
                     wb2=openpyxl.load_workbook(self.excel_file)
                     if "_Notifications" in wb2.sheetnames:
                         nws2=wb2["_Notifications"]
                         for rn,_ in unread:
                             nws2.cell(row=rn,column=2,value="Y")
-                        wb2.save(self.excel_file)
+                        tmp=f"{self.excel_file}.tmp"
+                        wb2.save(tmp)
+                        os.replace(tmp,self.excel_file)
                         self._excel_mtime=self._excel_mtime_now()
-                except: pass
+                except PermissionError:
+                    self.after(1200, mark_read)
+                    return
+                except Exception:
+                    pass
                 nd.destroy()
-                self._refresh_table()
+                self._refresh_list_if_visible()
 
             make_btn(ft_n,"Got it — mark as read",mark_read,"primary",padx=14,pady=6).pack(side="right")
         except Exception:
