@@ -261,7 +261,7 @@ PRIORITIES = ["High","Medium","Low"]
 UTILITY_OPTIONS = ["Electricity","Gas","Water","Heat Network","Cooling","Other"]
 COLS = ["ID","Reference","Client","Fund","Site","Utility Type","Specific Meter","Type","Status",
         "Priority","Description","Opened","Action Date","Resolved Date","Activity Log",
-        "Site Address","Supply Point ID","Meter Serial","Managing Agent Contact","Property Code",
+        "Site Address 1","Town","Postcode","Supply Point ID","Meter Serial","Managing Agent Contact","Property Code",
         "Last Updated By","Last Updated Date","Assigned To","Query Raised Date"]
 
 # QUERY_TYPES is populated after load_config is defined — see below
@@ -902,7 +902,8 @@ def load_site_data(sites_file):
     header_fragments = {
         "client","fund","site","address","utility","meter","contact",
         "property","prop","must be","note:","example","column","—","*",
-        "managing","agent","spid","serial","instruction","please","name"
+        "managing","agent","spid","serial","instruction","please","name",
+        "town","postcode"
     }
 
     def looks_like_header(val):
@@ -933,7 +934,7 @@ def load_site_data(sites_file):
         def gv(i): return str(row[i] or "").strip() if i<n else ""
         client=col_a
         fund=gv(1); prop_code=gv(2); site_name=gv(3)
-        address=gv(4); utility=gv(5); spid=gv(6); serial=gv(7); contact=gv(8)
+        address1=gv(4); town=gv(5); postcode=gv(6); utility=gv(7); spid=gv(8); serial=gv(9); contact=gv(10)
         if not site_name: continue
         if looks_like_header(site_name): continue
         if client not in clients: clients.append(client)
@@ -945,7 +946,7 @@ def load_site_data(sites_file):
         if site_name not in sites_by_fund[fkey]: sites_by_fund[fkey].append(site_name)
         key=(client,site_name)
         meters.setdefault(key,[]).append(dict(fund=fund,utility=utility,spid=spid,
-            serial=serial,address=address,contact=contact,prop_code=prop_code))
+            serial=serial,address1=address1,town=town,postcode=postcode,contact=contact,prop_code=prop_code))
         utilities_by_site.setdefault(key,[])
         if utility and utility not in utilities_by_site[key]: utilities_by_site[key].append(utility)
     # Sort everything A-Z so dropdowns are always alphabetical
@@ -965,12 +966,20 @@ def load_queries(excel_file):
         if not row[0]: continue
         n=len(row)
         def g(i,d=""): return str(row[i] or d) if i<n else d
-        if n>=20:
+        if n>=22:
             q={"id":g(0),"ref":g(1),"client":g(2),"fund":g(3),"site":g(4),"utility":g(5),
                "meter":g(6),"type":g(7),"status":g(8,"Open"),"priority":g(9,"Medium"),
              "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
              "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
-               "log":g(14),"address":g(15),"spid":g(16),"serial":g(17),"contact":g(18),
+               "log":g(14),"address1":g(15),"town":g(16),"postcode":g(17),"spid":g(18),"serial":g(19),"contact":g(20),
+             "prop_code":g(21),"last_by":g(22),"last_date":_to_iso_date_str(g(23)),"assigned_to":g(24),
+             "raised_date":_to_iso_date_str(g(25))}
+        elif n>=20:
+            q={"id":g(0),"ref":g(1),"client":g(2),"fund":g(3),"site":g(4),"utility":g(5),
+               "meter":g(6),"type":g(7),"status":g(8,"Open"),"priority":g(9,"Medium"),
+             "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
+             "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
+               "log":g(14),"address1":g(15),"town":"","postcode":"","spid":g(16),"serial":g(17),"contact":g(18),
              "prop_code":g(19),"last_by":g(20),"last_date":_to_iso_date_str(g(21)),"assigned_to":g(22),
              "raised_date":_to_iso_date_str(g(23))}
         else:
@@ -978,7 +987,7 @@ def load_queries(excel_file):
                "meter":g(5),"type":g(6),"status":g(7,"Open"),"priority":g(8,"Medium"),
              "desc":g(9),"opened":_to_iso_date_str(g(10)) or today_str(),
              "chase_date":_to_iso_date_str(g(11)),"resolved_date":_to_iso_date_str(g(12)),
-               "log":g(13),"address":g(14),"spid":g(15),"serial":g(16),"contact":g(17),
+               "log":g(13),"address1":g(14),"town":"","postcode":"","spid":g(15),"serial":g(16),"contact":g(17),
                "prop_code":g(18),"last_by":"","last_date":"","assigned_to":"","raised_date":""}
         queries.append(q)
     return queries
@@ -1088,7 +1097,7 @@ def save_all_queries(queries,excel_file):
         ws=wb.create_sheet("Queries",0)
         thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
         hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
-        widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,30,20,20,28,14,18,14,18,12]
+        widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,28,16,14,20,20,28,14,18,14,18,12]
         for i,(col,w) in enumerate(zip(COLS,widths),1):
             c=ws.cell(row=1,column=i,value=col)
             c.font=hfnt; c.fill=hfil; c.alignment=Alignment(horizontal="center",vertical="center"); c.border=bdr
@@ -1100,7 +1109,8 @@ def save_all_queries(queries,excel_file):
             vals=[q["id"],q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
                   q["type"],q["status"],q["priority"],q["desc"],q["opened"],
                   q.get("chase_date",""),q.get("resolved_date",""),q["log"],
-                  q["address"],q["spid"],q["serial"],q["contact"],q["prop_code"],
+                  q.get("address1",""),q.get("town",""),q.get("postcode",""),
+                  q["spid"],q["serial"],q["contact"],q["prop_code"],
                   q.get("last_by",""),q.get("last_date",""),q.get("assigned_to",""),
                   q.get("raised_date","")]
             for c,v in enumerate(vals,1):
@@ -1756,8 +1766,8 @@ class SetupWizard(tk.Toplevel):
                           "• Data doesn't start in column A\n"
                           "• Sheet name is unexpected (check above)\n"
                           "• Column order is different from expected:\n"
-                          "  A=Client, B=Fund, C=Prop code, D=Site, E=Address,\n"
-                          "  F=Utility, G=SPID, H=Serial, I=Contact")
+                          "  A=Client, B=Fund, C=Prop code, D=Site, E=Address 1,\n"
+                          "  F=Town, G=Postcode, H=Utility, I=SPID, J=Serial, K=Contact")
                 messagebox.showinfo("Site file diagnostic",msg,parent=self)
             except Exception as e:
                 messagebox.showerror("Error reading file",str(e),parent=self)
@@ -4463,12 +4473,12 @@ class QueryTrackerApp(tk.Tk):
             ws1=wb.create_sheet("Query List")
             title_block(ws1,"Query Report — Full Detail",period_label)
 
-            cols1=["Ref","Client","Fund","Site","Address","Utility","Meter",
+            cols1=["Ref","Client","Fund","Site","Address 1","Town","Postcode","Utility","Meter",
                    "Type","Status","Priority","Query Raised","Logged","Action Date","Resolved",
                    "SLA Intake","Days Open","Description","Activity Log",
                    "Supply Point ID","Meter Serial","Contact","Prop Code",
                    "Assigned To","Last Updated By"]
-            widths1=[12,24,22,26,30,14,20,
+            widths1=[12,24,22,26,26,16,12,14,20,
                      20,14,10,12,12,12,12,
                      12,10,50,60,
                      18,14,24,12,
@@ -4504,7 +4514,7 @@ class QueryTrackerApp(tk.Tk):
                 intake=intake_days(q)
                 vals=[
                     q["ref"], q["client"], q.get("fund",""), q["site"],
-                    q.get("address",""), q.get("utility",""), q.get("meter",""),
+                    q.get("address1",""), q.get("town",""), q.get("postcode",""), q.get("utility",""), q.get("meter",""),
                     q["type"], q["status"], q["priority"],
                     fmt_date(q.get("raised_date","")), fmt_date(q["opened"]),
                     fmt_date(q.get("chase_date","")),
@@ -4623,7 +4633,7 @@ class QueryTrackerApp(tk.Tk):
             # Plain header row — no title block, no merges, column names only
             # One row per query, all fields, log as bullet points in one cell
             upload_cols=[
-                "Reference","Client","Fund","Site","Address",
+                "Reference","Client","Fund","Site","Address 1","Town","Postcode",
                 "Utility","Meter","Query Type","Status","Priority",
                 "Query Raised","Logged","Action Date","Resolved Date",
                 "SLA Intake","Days Open",
@@ -4633,7 +4643,7 @@ class QueryTrackerApp(tk.Tk):
                 "Export Date"
             ]
             upload_widths=[
-                12,26,22,28,32,
+                12,26,22,28,26,16,12,
                 14,20,22,14,10,
                 12,12,12,12,
                 12,10,
@@ -4660,7 +4670,7 @@ class QueryTrackerApp(tk.Tk):
                 intake=intake_days(q)
                 row_vals=[
                     q["ref"], q["client"], q.get("fund",""), q["site"],
-                    q.get("address",""),
+                    q.get("address1",""), q.get("town",""), q.get("postcode",""),
                     q.get("utility",""), q.get("meter",""),
                     q["type"], q["status"], q["priority"],
                     fmt_date(q.get("raised_date","")),
@@ -5869,7 +5879,8 @@ class QueryTrackerApp(tk.Tk):
         # Chase date: use existing for edits, otherwise default to +7 days
         _default_chase=(date.today()+timedelta(days=7)).strftime("%Y-%m-%d")
         chase_var=tk.StringVar(value=cf.get("chase_date",_default_chase) if is_edit else _default_chase)
-        prop_var=tk.StringVar(value=cf.get("prop_code","")); address_var=tk.StringVar(value=cf.get("address",""))
+        prop_var=tk.StringVar(value=cf.get("prop_code","")); address1_var=tk.StringVar(value=cf.get("address1",""))
+        town_var=tk.StringVar(value=cf.get("town","")); postcode_var=tk.StringVar(value=cf.get("postcode",""))
         spid_var=tk.StringVar(value=cf.get("spid","")); serial_var=tk.StringVar(value=cf.get("serial",""))
         contact_var=tk.StringVar(value=cf.get("contact",""))
         raised_var=tk.StringVar(value=cf.get("raised_date", today_str() if not is_edit else ""))
@@ -5895,7 +5906,9 @@ class QueryTrackerApp(tk.Tk):
             ns_fund=tk.StringVar(value=fund_var.get())
             ns_site=tk.StringVar(value=site_var.get())
             ns_prop=tk.StringVar(value=prop_var.get())
-            ns_addr=tk.StringVar(value=address_var.get())
+            ns_addr=tk.StringVar(value=address1_var.get())
+            ns_town=tk.StringVar(value=town_var.get())
+            ns_postcode=tk.StringVar(value=postcode_var.get())
             ns_util=tk.StringVar(value=utility_var.get())
             ns_spid=tk.StringVar(value=spid_var.get())
             ns_serial=tk.StringVar(value=serial_var.get())
@@ -5921,7 +5934,9 @@ class QueryTrackerApp(tk.Tk):
             tk.Label(body_ns,text="OPTIONAL",font=(FONT,8,"bold"),bg=BG,fg=MUTED).pack(anchor="w",pady=(10,4))
             ns_row("Fund",ns_fund)
             ns_row("Property code",ns_prop)
-            ns_row("Address",ns_addr)
+            ns_row("Address line 1",ns_addr)
+            ns_row("Town / City",ns_town)
+            ns_row("Postcode",ns_postcode)
             ns_row("Utility type",ns_util,opts=UTILITY_OPTIONS)
             ns_row("Supply point ID",ns_spid)
             ns_row("Meter serial",ns_serial)
@@ -5942,7 +5957,8 @@ class QueryTrackerApp(tk.Tk):
                     sws=swb["Sites"] if "Sites" in swb.sheetnames else swb.active
                     sws.append([
                         client_val, ns_fund.get().strip(), ns_prop.get().strip(),
-                        site_val,   ns_addr.get().strip(), ns_util.get().strip(),
+                        site_val,   ns_addr.get().strip(), ns_town.get().strip(), ns_postcode.get().strip(),
+                        ns_util.get().strip(),
                         ns_spid.get().strip(), ns_serial.get().strip(), ns_contact.get().strip()
                     ])
                     swb.save(self.sites_file)
@@ -5963,7 +5979,9 @@ class QueryTrackerApp(tk.Tk):
                 site_var.set(site_val)
                 fund_cb.configure(values=self.funds_by_client.get(client_val,[]))
                 if ns_fund.get().strip(): fund_var.set(ns_fund.get().strip())
-                if ns_addr.get().strip(): address_var.set(ns_addr.get().strip())
+                if ns_addr.get().strip(): address1_var.set(ns_addr.get().strip())
+                if ns_town.get().strip(): town_var.set(ns_town.get().strip())
+                if ns_postcode.get().strip(): postcode_var.set(ns_postcode.get().strip())
                 if ns_prop.get().strip(): prop_var.set(ns_prop.get().strip())
                 if ns_spid.get().strip(): spid_var.set(ns_spid.get().strip())
                 if ns_serial.get().strip(): serial_var.set(ns_serial.get().strip())
@@ -6149,7 +6167,9 @@ class QueryTrackerApp(tk.Tk):
         pc=tk.Frame(pf,bg=CARD,highlightthickness=1,highlightbackground=BORDER); pc.pack(side="left",fill="x",expand=True)
         tk.Entry(pc,textvariable=prop_var,font=(FONT,10),bg=CARD,fg=TEXT,relief="flat",bd=6,highlightthickness=0).pack(fill="x")
 
-        self._labeled_entry(form,"Site address",address_var)
+        self._labeled_entry(form,"Address line 1",address1_var)
+        self._labeled_entry(form,"Town / City",town_var)
+        self._labeled_entry(form,"Postcode",postcode_var)
         self._labeled_entry(form,"Supply point ID",spid_var)
         self._labeled_entry(form,"Meter serial",serial_var)
         self._labeled_entry(form,"Managing agent contact",contact_var)
@@ -6178,7 +6198,7 @@ class QueryTrackerApp(tk.Tk):
             site_cb.configure(values=sites)
             # Clear dependent fields
             for v in [site_var,fund_var,utility_var,meter_var,
-                      prop_var,address_var,spid_var,serial_var,contact_var]:
+                      prop_var,address1_var,town_var,postcode_var,spid_var,serial_var,contact_var]:
                 v.set("")
             utility_cb.configure(values=[])
             meter_cb.configure(values=[])
@@ -6198,7 +6218,7 @@ class QueryTrackerApp(tk.Tk):
             # Only reset site if it no longer fits the fund filter
             if site_var.get() and site_var.get() not in sites:
                 for v in [site_var,utility_var,meter_var,
-                          prop_var,address_var,spid_var,serial_var,contact_var]:
+                          prop_var,address1_var,town_var,postcode_var,spid_var,serial_var,contact_var]:
                     v.set("")
                 utility_cb.configure(values=[])
 
@@ -6222,7 +6242,7 @@ class QueryTrackerApp(tk.Tk):
             utility_cb.configure(values=utils,state="readonly" if utils else "normal")
             utility_var.set(""); meter_var.set(""); meter_cb.configure(values=[])
             if rows:
-                address_var.set(rows[0]["address"]); contact_var.set(rows[0]["contact"])
+                address1_var.set(rows[0]["address1"]); town_var.set(rows[0]["town"]); postcode_var.set(rows[0]["postcode"]); contact_var.set(rows[0]["contact"])
                 prop_var.set(rows[0]["prop_code"])
                 if rows[0]["prop_code"]: prop_frame.pack(fill="x",pady=4)
                 else: prop_frame.pack_forget()
@@ -6324,7 +6344,8 @@ class QueryTrackerApp(tk.Tk):
                 try:
                     wb=openpyxl.load_workbook(self.sites_file)
                     wb["Sites"].append([c,existing.get("fund",""),existing.get("prop_code",""),s,
-                        existing.get("address",""),nu_var.get().strip(),ns_var.get().strip(),
+                        existing.get("address1",""),existing.get("town",""),existing.get("postcode",""),
+                        nu_var.get().strip(),ns_var.get().strip(),
                         nr_var.get().strip(),existing.get("contact","")])
                     wb.save(self.sites_file)
                 except PermissionError:
@@ -6359,7 +6380,7 @@ class QueryTrackerApp(tk.Tk):
             ml_combo("Utility type *",nu_var,UTILITY_OPTIONS)
             ml_entry("Supply point ID",ns_var); ml_entry("Meter serial",nr_var)
             divider(body)
-            for lbl,val in [("Address",existing.get("address","")),("Contact",existing.get("contact",""))]:
+            for lbl,val in [("Address 1",existing.get("address1","")),("Town",existing.get("town","")),("Postcode",existing.get("postcode","")),("Contact",existing.get("contact",""))]:
                 if val:
                     r=tk.Frame(body,bg=BG); r.pack(fill="x",pady=1)
                     tk.Label(r,text=lbl,font=(FONT,8),bg=BG,fg=MUTED,width=12,anchor="w").pack(side="left")
@@ -6409,7 +6430,7 @@ class QueryTrackerApp(tk.Tk):
                     "status":status_var.get(),"priority":priority_var.get(),
                     "desc":new_desc,
                     "chase_date":new_chase,
-                    "address":address_var.get(),"spid":spid_var.get(),
+                    "address1":address1_var.get(),"town":town_var.get(),"postcode":postcode_var.get(),"spid":spid_var.get(),
                     "serial":serial_var.get(),"contact":contact_var.get(),
                     "prop_code":prop_var.get(),"assigned_to":assignee,
                     "raised_date":live_query.get("raised_date","") if is_type_changed_query else raised,
@@ -6437,7 +6458,7 @@ class QueryTrackerApp(tk.Tk):
                     ws_s=wb["Sites"] if "Sites" in wb.sheetnames else wb.active
                     ws_s.append([
                         client, fund_var.get().strip(), prop_var.get().strip(),
-                        site, address_var.get().strip(),
+                        site, address1_var.get().strip(), town_var.get().strip(), postcode_var.get().strip(),
                         utility_var.get().strip(), spid_var.get().strip(),
                         serial_var.get().strip(), contact_var.get().strip()
                     ])
@@ -6460,7 +6481,7 @@ class QueryTrackerApp(tk.Tk):
                "desc":desc_text.get("1.0","end").strip(),"opened":today_str(),
                "chase_date":chase_var.get().strip(),"resolved_date":"",
                "log":log_entry,
-               "address":address_var.get(),"spid":spid_var.get(),"serial":serial_var.get(),
+               "address1":address1_var.get(),"town":town_var.get(),"postcode":postcode_var.get(),"spid":spid_var.get(),"serial":serial_var.get(),
                "contact":contact_var.get(),"prop_code":prop_var.get(),
                "last_by":self.username,"last_date":today_str(),
                "assigned_to":assignee,"raised_date":raised}
