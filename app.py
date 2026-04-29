@@ -1288,6 +1288,13 @@ def _safe_folder_name(s):
     for ch in r'\/:*?"<>|': s=s.replace(ch,"_")
     return s.strip()[:60] or "Unknown"
 
+def is_recurring_query(q):
+    qtype=str(q.get("type","") or "").strip().lower()
+    if qtype=="recurring":
+        return True
+    text=(str(q.get("desc","")) + " " + str(q.get("log",""))).lower()
+    return "[recurring]" in text or "recurring task" in text
+
 def get_attachments_root(sites_file):
     app_level = os.path.join(APP_DIR, "ATTACHMENTS")
     if os.path.exists(app_level):
@@ -2512,6 +2519,7 @@ class QueryTrackerApp(tk.Tk):
         try: self.sync_lbl.config(text="● Live")
         except: pass
         self.after(1200,self._check_notifications)  # slight delay so UI is fully drawn
+        self.after(1800,self._show_sickness_reallocation_alert)
 
     def _is_my_assignment(self, assigned_to):
         a=(assigned_to or "").strip().lower()
@@ -2839,6 +2847,8 @@ class QueryTrackerApp(tk.Tk):
         try:
             if _ignore_combobox_wheel(e)=="break":
                 return "break"
+            if not self._app_has_focus():
+                return
             if getattr(self,"_current_page","")!="list":
                 return
             px,py=self.winfo_pointerxy()
@@ -2967,6 +2977,43 @@ class QueryTrackerApp(tk.Tk):
         self.out_of_office=self._normalize_out_of_office(self.out_of_office)
         self.cfg["out_of_office"]=self.out_of_office
         save_config(self.cfg)
+
+    def _show_sickness_reallocation_alert(self):
+        today=today_str()
+        if getattr(self,"_sickness_alert_shown_for","")==today:
+            return
+        sick_members=sorted({
+            entry.get("member","")
+            for entry in getattr(self,"out_of_office",[])
+            if entry.get("date")==today and str(entry.get("type","")).strip().lower()=="sickness"
+        })
+        if not sick_members:
+            return
+        rows=[]
+        for member in sick_members:
+            if not member:
+                continue
+            tasks=[
+                q for q in self.queries
+                if q.get("status")!="Resolved"
+                and not is_recurring_query(q)
+                and q.get("assigned_to","")==member
+                and q.get("chase_date","")
+                and q.get("chase_date","")<=today
+            ]
+            if tasks:
+                refs=", ".join(q.get("ref","") for q in tasks[:5])
+                extra="" if len(tasks)<=5 else f" +{len(tasks)-5} more"
+                rows.append(f"• {member}: {len(tasks)} action today ({refs}{extra})")
+        self._sickness_alert_shown_for=today
+        if rows:
+            messagebox.showwarning(
+                "Team sickness alert",
+                "A team member is marked as sick today with action items due.\n\n"
+                "Please review and re-allocate if needed:\n"
+                + "\n".join(rows),
+                parent=self,
+            )
 
     def _open_out_of_office_dialog(self):
         dlg=tk.Toplevel(self)
@@ -3350,7 +3397,11 @@ class QueryTrackerApp(tk.Tk):
         
         # Apply assignee filter if set
         af = getattr(self, "_assignee_filter", "")
-        filtered_queries = [q for q in self.queries if not af or q.get("assigned_to", "") == af]
+        filtered_queries = [
+            q for q in self.queries
+            if (not af or q.get("assigned_to", "") == af)
+            and not is_recurring_query(q)
+        ]
         
         summary=tk.Frame(dp,bg=BG); summary.pack(fill="x",pady=(4,0))
         open_n=sum(1 for q in filtered_queries if q["status"]!="Resolved")
@@ -3764,7 +3815,8 @@ class QueryTrackerApp(tk.Tk):
         qs=[q for q in self.queries
             if in_period(q)
             and (rpt_client=="All" or q["client"]==rpt_client)
-            and (rpt_person=="All" or q.get("assigned_to","")==rpt_person)]
+            and (rpt_person=="All" or q.get("assigned_to","")==rpt_person)
+            and not is_recurring_query(q)]
         total_n=len(qs)
 
         # Active filter summary line
@@ -4811,6 +4863,7 @@ class QueryTrackerApp(tk.Tk):
                     self.sync_lbl.config(text=f"↻ Synced {ts}")
                     self.after(5000,lambda:self.sync_lbl.config(text="● Live") if self.sync_lbl.winfo_exists() else None)
                 except: pass
+                self.after(300,self._show_sickness_reallocation_alert)
         except: pass
 
     def _excel_mtime_now(self):
@@ -5142,6 +5195,8 @@ class QueryTrackerApp(tk.Tk):
         day_filter=getattr(self,"_calendar_day_filter","")
         source=[]
         for q in self.queries:
+            if is_recurring_query(q):
+                continue
             if af and q.get("assigned_to","")!=af:
                 continue
             if fa_val!="All" and q.get("assigned_to","")!=fa_val:
@@ -5185,7 +5240,7 @@ class QueryTrackerApp(tk.Tk):
 
     def _show_daily_banner(self):
         today=today_str()
-        items=[q for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today]
+        items=[q for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today and not is_recurring_query(q)]
         if items:
             preview=", ".join(f"{q['ref']} ({q['client']})" for q in items[:3])
             extra=f" +{len(items)-3} more" if len(items)>3 else ""
@@ -5791,7 +5846,7 @@ class QueryTrackerApp(tk.Tk):
 
         dlg=tk.Toplevel(self)
         dlg.title(f"Edit {cf['ref']}" if is_edit else "New Query")
-        dlg.geometry("640x860"); dlg.configure(bg=BG); dlg.grab_set(); dlg.resizable(False,True)
+        dlg.geometry("640x860"); dlg.configure(bg=BG); dlg.resizable(False,True)
         hdr=tk.Frame(dlg,bg=NAV,padx=24,pady=16); hdr.pack(fill="x")
         tk.Label(hdr,text=f"✎  Edit {cf['ref']}" if is_edit else "＋  Log new query",
                  font=(FONT,13,"bold"),bg=NAV,fg="white").pack(anchor="w")
@@ -5817,7 +5872,8 @@ class QueryTrackerApp(tk.Tk):
         prop_var=tk.StringVar(value=cf.get("prop_code","")); address_var=tk.StringVar(value=cf.get("address",""))
         spid_var=tk.StringVar(value=cf.get("spid","")); serial_var=tk.StringVar(value=cf.get("serial",""))
         contact_var=tk.StringVar(value=cf.get("contact",""))
-        raised_var=tk.StringVar(value=cf.get("raised_date",""))
+        raised_var=tk.StringVar(value=cf.get("raised_date", today_str() if not is_edit else ""))
+        raised_enabled_var=tk.BooleanVar(value=is_edit or bool(cf.get("raised_date","")))
         is_type_changed_query = bool(re.search(r"Query created from type change", cf.get("log", "")))
 
         tk.Label(form,text="QUERY DETAILS",font=(FONT,8,"bold"),bg=BG,fg=MUTED).pack(anchor="w",pady=(0,8))
@@ -5953,16 +6009,70 @@ class QueryTrackerApp(tk.Tk):
         assignee_cb=make_combo(assignee_row,assignee_var,["(Unassigned)"]+all_members,readonly=False,width=34)
         assignee_cb.pack(side="left",fill="x",expand=True)
 
+        recurring_var=tk.BooleanVar(value=is_recurring_query(cf))
+        recurring_row=tk.Frame(form,bg=BG); recurring_row.pack(fill="x",pady=(2,4))
+        tk.Label(recurring_row,text="Reporting",font=(FONT,9),bg=BG,fg=MUTED,width=22,anchor="w").pack(side="left")
+        recurring_cb=tk.Checkbutton(
+            recurring_row,
+            text="Recurring task (exclude from reports/dashboard counts)",
+            variable=recurring_var,
+            onvalue=True,
+            offvalue=False,
+            bg=BG,
+            fg=TEXT2,
+            activebackground=BG,
+            activeforeground=TEXT,
+            selectcolor=CARD,
+            font=(FONT,9),
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+        )
+        recurring_cb.pack(side="left")
+
         # ── Query raised date ──────────────────────────────────────────────────
         if not (is_edit and is_type_changed_query):
-            raised_frame=tk.Frame(form,bg=BG); raised_frame.pack(fill="x",pady=4)
-            tk.Label(raised_frame,text="Query raised by client",font=(FONT,9),bg=BG,fg=MUTED,width=22,anchor="w").pack(side="left")
+            raised_toggle_row=tk.Frame(form,bg=BG); raised_toggle_row.pack(fill="x",pady=(2,2))
+            if not is_edit:
+                cb=tk.Checkbutton(
+                    raised_toggle_row,
+                    text="Raised by client on a different date",
+                    variable=raised_enabled_var,
+                    onvalue=True,
+                    offvalue=False,
+                    bg=BG,
+                    fg=TEXT2,
+                    activebackground=BG,
+                    activeforeground=TEXT,
+                    selectcolor=CARD,
+                    font=(FONT,9),
+                    highlightthickness=0,
+                    bd=0,
+                    relief="flat",
+                )
+                cb.pack(side="left")
+            else:
+                tk.Label(raised_toggle_row,text="Query raised by client",font=(FONT,9,"bold"),bg=BG,fg=MUTED).pack(side="left")
+
+            raised_frame=tk.Frame(form,bg=BG)
+
+            tk.Label(raised_frame,text="Raised date",font=(FONT,9),bg=BG,fg=MUTED,width=22,anchor="w").pack(side="left")
             rc=tk.Frame(raised_frame,bg=CARD,highlightthickness=1,highlightbackground=BORDER); rc.pack(side="left",fill="x",expand=True)
             tk.Entry(rc,textvariable=raised_var,font=(FONT,10),bg=CARD,fg=TEXT,relief="flat",bd=6,
                      highlightthickness=0).pack(fill="x",side="left",expand=True)
             make_btn(raised_frame,"📅",lambda:_show_cal(dlg,raised_var),"default",padx=8,pady=4).pack(side="left",padx=(4,0))
             tk.Label(raised_frame,text="When the client emailed / raised this",
                      font=(FONT,8),bg=BG,fg=MUTED).pack(side="left",padx=(8,0))
+
+            def _toggle_raised(*_):
+                if is_edit or raised_enabled_var.get():
+                    if not raised_var.get().strip():
+                        raised_var.set(today_str())
+                    raised_frame.pack(fill="x",pady=4)
+                else:
+                    raised_frame.pack_forget()
+            raised_enabled_var.trace_add("write",_toggle_raised)
+            _toggle_raised()
 
         chase_frame=tk.Frame(form,bg=BG); chase_frame.pack(fill="x",pady=4)
         tk.Label(chase_frame,text="Action date",font=(FONT,9),bg=BG,fg=MUTED,width=22,anchor="w").pack(side="left")
@@ -6277,7 +6387,7 @@ class QueryTrackerApp(tk.Tk):
                 return
             client=client_var.get().strip()
             site=site_var.get().strip()
-            raised=raised_var.get().strip()
+            raised=(raised_var.get().strip() if (is_edit or raised_enabled_var.get()) else today_str())
 
             if is_edit:
                 old_chase=edit_query.get("chase_date","").strip()
@@ -6308,6 +6418,12 @@ class QueryTrackerApp(tk.Tk):
                 if is_pushback(old_chase, new_chase, prev_last_date):
                     append_pushback_event(live_query, self.username, old_chase, new_chase)
                 live_query["log"]+= f" | {stamp(self.username)} Query details edited"
+                marker="[Recurring]"
+                if recurring_var.get():
+                    if marker not in live_query["log"]:
+                        live_query["log"]+=f" | {marker}"
+                else:
+                    live_query["log"]=live_query["log"].replace(f" | {marker}","").replace(marker,"")
                 if not self._save_queries():
                     return
                 self._refresh_table(); self._show_daily_banner(); dlg.destroy()
@@ -6332,6 +6448,8 @@ class QueryTrackerApp(tk.Tk):
                 except Exception as e:
                     messagebox.showwarning("Site list not updated",f"Query saved but could not add to sites.xlsx:\n{e}",parent=dlg)
             log_entry=f"{stamp(self.username)} Query logged"
+            if recurring_var.get():
+                log_entry += " | [Recurring]"
             if raised and raised!=today_str():
                 log_entry+=f" — client raised on {fmt_date(raised)}"
             q={"id":str(int(datetime.now().timestamp()*1000)),
@@ -6365,7 +6483,7 @@ class QueryTrackerApp(tk.Tk):
         self.recent_ids=self.recent_ids[:5]
 
         dlg=tk.Toplevel(self); dlg.title(f"{q['ref']}")
-        dlg.geometry("700x860"); dlg.configure(bg=BG); dlg.grab_set(); dlg.resizable(False,True)
+        dlg.geometry("700x860"); dlg.configure(bg=BG); dlg.resizable(False,True)
 
         sc,scbg=S_COLORS.get(q["status"],(TEXT2,CARD2))
         hdr=tk.Frame(dlg,bg=NAV,padx=24,pady=18); hdr.pack(fill="x")
@@ -6523,26 +6641,7 @@ class QueryTrackerApp(tk.Tk):
         all_members=list(dict.fromkeys([self.username]+self.team_members))
         make_combo(arow,assignee_var_d,["(Unassigned)"]+all_members,readonly=False,width=22).pack(side="left")
 
-        # Raised date row — when the client originally raised the query
-        raised_var_d=tk.StringVar(value=q.get("raised_date",""))
-        is_type_changed_query = bool(re.search(r"Query created from type change", q.get("log", "")))
-        if not is_type_changed_query:
-            rrow=tk.Frame(ec,bg=CARD2); rrow.pack(fill="x",pady=(8,0))
-            tk.Label(rrow,text="Query raised by client",font=(FONT,9),bg=CARD2,fg=TEXT2).pack(side="left",padx=(0,8))
-            rf2=tk.Frame(rrow,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); rf2.pack(side="left")
-            tk.Entry(rf2,textvariable=raised_var_d,font=(FONT,10),bg=CARD2,fg=TEXT,
-                     insertbackground=TEXT,relief="flat",bd=5,width=12,highlightthickness=0).pack()
-            make_btn(rrow,"📅",lambda:_show_cal(dlg,raised_var_d),"default",padx=6,pady=3).pack(side="left",padx=(4,0))
-            # Show intake time if raised date is set and different from opened
-            if q.get("raised_date") and q["raised_date"]!=q.get("opened",""):
-                try:
-                    intake=sla_intake_working_days(q.get("raised_date", ""), q.get("opened", ""))
-                    sla_met=intake<=1
-                    intake_col=SUCCESS if sla_met else DANGER
-                    sla_txt=f"  {intake}d — SLA {"MET ✓" if sla_met else "BREACHED ✗"}"
-                    tk.Label(rrow,text=sla_txt,font=(FONT,8,"bold"),
-                             bg=CARD2,fg=intake_col).pack(side="left",padx=(8,0))
-                except: pass
+        # Raised date is edited via the dedicated Edit Query form to keep detail view lightweight.
 
         # Action buttons: Copy Summary and Related Queries
         action_frame = tk.Frame(body, bg=BG)
@@ -6880,8 +6979,6 @@ class QueryTrackerApp(tk.Tk):
             live_q["chase_date"]=new_chase; live_q["desc"]=new_desc
             live_q["last_by"]=self.username; live_q["last_date"]=today_str()
             live_q["assigned_to"]=assignee
-            if not is_type_changed_query:
-                live_q["raised_date"]=raised_var_d.get().strip()
             if pending_note:
                 live_q["log"] += f" | {stamp(self.username)} {pending_note}"
             if is_pushback(old_chase, new_chase, prev_last_date):
