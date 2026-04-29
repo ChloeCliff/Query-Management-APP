@@ -494,7 +494,12 @@ def save_shared_settings(excel_file, query_types, team_members):
     """Write query types and team members into the _Settings sheet of the shared tracker."""
     if not excel_file or not os.path.exists(excel_file):
         return
+    lock_fd=None
+    lock_path=None
     try:
+        lock_fd, lock_path = _acquire_excel_lock(excel_file, timeout=8.0)
+        if lock_fd is None:
+            return
         wb = openpyxl.load_workbook(excel_file)
         if "_Settings" in wb.sheetnames:
             del wb["_Settings"]
@@ -506,9 +511,13 @@ def save_shared_settings(excel_file, query_types, team_members):
         ws.cell(row=row, column=1, value="[team_members]")
         for i, tm in enumerate(team_members, start=row+1):
             ws.cell(row=i, column=1, value=tm)
-        wb.save(excel_file)
+        tmp=f"{excel_file}.tmp"
+        wb.save(tmp)
+        os.replace(tmp,excel_file)
     except Exception:
         pass
+    finally:
+        _release_excel_lock(lock_fd, lock_path)
 
 def get_query_types(excel_file=None):
     """Load query types from the shared tracker first, then local config, then defaults."""
@@ -996,77 +1005,131 @@ def _merge_queries_for_save(local_queries, excel_file):
 
     merged = []
     for qid in merged_ids:
-        if qid in local_by_id:
+        if qid in local_by_id and qid in remote_by_id:
+            lq=dict(local_by_id[qid])
+            rq=remote_by_id[qid]
+            l_entries=[p.strip() for p in (lq.get("log","") or "").split(" | ") if p and p.strip()]
+            r_entries=[p.strip() for p in (rq.get("log","") or "").split(" | ") if p and p.strip()]
+            combined=[]
+            for ent in r_entries+l_entries:
+                if ent not in combined:
+                    combined.append(ent)
+            if combined:
+                lq["log"]=" | ".join(combined)
+            merged.append(lq)
+        elif qid in local_by_id:
             merged.append(local_by_id[qid])
         elif qid in remote_by_id:
             merged.append(remote_by_id[qid])
     return merged
 
+def _acquire_excel_lock(excel_file, timeout=20.0, stale_seconds=180.0):
+    lock_path=f"{excel_file}.qblock"
+    deadline=datetime.now().timestamp()+timeout
+    while datetime.now().timestamp()<deadline:
+        try:
+            fd=os.open(lock_path, os.O_CREAT|os.O_EXCL|os.O_WRONLY)
+            try:
+                os.write(fd, f"pid={os.getpid()} ts={datetime.now().isoformat()}".encode("utf-8"))
+            except Exception:
+                pass
+            return fd, lock_path
+        except FileExistsError:
+            try:
+                age=datetime.now().timestamp()-os.path.getmtime(lock_path)
+                if age>stale_seconds:
+                    os.remove(lock_path)
+                    continue
+            except Exception:
+                pass
+            threading.Event().wait(0.2)
+        except Exception:
+            break
+    return None, lock_path
+
+def _release_excel_lock(fd, lock_path):
+    try:
+        if fd is not None:
+            os.close(fd)
+    except Exception:
+        pass
+    try:
+        if lock_path and os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+
 def save_all_queries(queries,excel_file):
     if not excel_file: return
-    queries = _merge_queries_for_save(queries, excel_file)
-    if os.path.exists(excel_file):
-        try:
-            wb=openpyxl.load_workbook(excel_file)
-        except Exception:
+    lock_fd, lock_path = _acquire_excel_lock(excel_file, timeout=22.0)
+    if lock_fd is None:
+        raise PermissionError("Tracker is locked by another app instance")
+    try:
+        queries = _merge_queries_for_save(queries, excel_file)
+        if os.path.exists(excel_file):
+            try:
+                wb=openpyxl.load_workbook(excel_file)
+            except Exception:
+                wb=openpyxl.Workbook()
+        else:
             wb=openpyxl.Workbook()
-    else:
-        wb=openpyxl.Workbook()
 
-    # Preserve all non-query sheets (e.g. _Notifications / shared settings)
-    # and regenerate only the data views managed by this app.
-    for sheet_name in ["Queries","Dashboard"]:
-        if sheet_name in wb.sheetnames:
-            del wb[sheet_name]
-    if "Sheet" in wb.sheetnames and len(wb.sheetnames)==1:
-        try:
-            del wb["Sheet"]
-        except Exception:
-            pass
+        # Preserve all non-query sheets (e.g. _Notifications / shared settings)
+        # and regenerate only the data views managed by this app.
+        for sheet_name in ["Queries","Dashboard"]:
+            if sheet_name in wb.sheetnames:
+                del wb[sheet_name]
+        if "Sheet" in wb.sheetnames and len(wb.sheetnames)==1:
+            try:
+                del wb["Sheet"]
+            except Exception:
+                pass
 
-    ws=wb.create_sheet("Queries",0)
-    thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
-    hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
-    widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,30,20,20,28,14,18,14,18,12]
-    for i,(col,w) in enumerate(zip(COLS,widths),1):
-        c=ws.cell(row=1,column=i,value=col)
-        c.font=hfnt; c.fill=hfil; c.alignment=Alignment(horizontal="center",vertical="center"); c.border=bdr
-        ws.column_dimensions[get_column_letter(i)].width=w
-    ws.row_dimensions[1].height=20
-    sfills={"Open":"DBEAFE","In Progress":"FEF3C7","Pending info":"F3F4F6","Resolved":"D1FAE5"}
-    pfills={"High":"FEE2E2","Medium":"FEF9C3","Low":"F0FDF4"}
-    for r,q in enumerate(queries,2):
-        vals=[q["id"],q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
-              q["type"],q["status"],q["priority"],q["desc"],q["opened"],
-              q.get("chase_date",""),q.get("resolved_date",""),q["log"],
-              q["address"],q["spid"],q["serial"],q["contact"],q["prop_code"],
-              q.get("last_by",""),q.get("last_date",""),q.get("assigned_to",""),
-              q.get("raised_date","")]
-        for c,v in enumerate(vals,1):
-            cell=ws.cell(row=r,column=c,value=v)
-            cell.font=Font(name=FONT,size=10)
-            cell.alignment=Alignment(vertical="top",wrap_text=(c in (11,15))); cell.border=bdr
-        ws.cell(row=r,column=9).fill=PatternFill("solid",fgColor=sfills.get(q["status"],"FFFFFF"))
-        ws.cell(row=r,column=10).fill=PatternFill("solid",fgColor=pfills.get(q["priority"],"FFFFFF"))
-    ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:{get_column_letter(len(COLS))}1"
-    ds=wb.create_sheet("Dashboard",1); ds.sheet_view.showGridLines=False
-    ds["A1"]="Query Tracker — Dashboard"
-    ds["A1"].font=Font(bold=True,size=14,name=FONT,color="0F1B2D")
-    ds["A2"]=f"Last updated: {date.today().strftime('%d/%m/%Y')}"
-    ds["A2"].font=Font(size=10,name=FONT,color="6B7280")
-    today=today_str()
-    stats=[("Total",len(queries)),("Open",sum(1 for q in queries if q["status"]!="Resolved")),
-           ("Resolved",sum(1 for q in queries if q["status"]=="Resolved")),
-           ("Action today",sum(1 for q in queries if q["status"]!="Resolved" and q.get("chase_date","")<=today and q.get("chase_date","")))]
-    for i,(lbl,val) in enumerate(stats):
-        col=i*2+1
-        ds.cell(row=4,column=col,value=lbl).font=Font(name=FONT,size=9,color="6B7280")
-        ds.cell(row=5,column=col,value=val).font=Font(name=FONT,size=18,bold=True,
-            color="DC2626" if lbl=="Action today" and val>0 else "0F1B2D")
-        ds.column_dimensions[get_column_letter(col)].width=18
-    tmp=f"{excel_file}.tmp"
-    wb.save(tmp)
-    os.replace(tmp,excel_file)
+        ws=wb.create_sheet("Queries",0)
+        thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
+        hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
+        widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,30,20,20,28,14,18,14,18,12]
+        for i,(col,w) in enumerate(zip(COLS,widths),1):
+            c=ws.cell(row=1,column=i,value=col)
+            c.font=hfnt; c.fill=hfil; c.alignment=Alignment(horizontal="center",vertical="center"); c.border=bdr
+            ws.column_dimensions[get_column_letter(i)].width=w
+        ws.row_dimensions[1].height=20
+        sfills={"Open":"DBEAFE","In Progress":"FEF3C7","Pending info":"F3F4F6","Resolved":"D1FAE5"}
+        pfills={"High":"FEE2E2","Medium":"FEF9C3","Low":"F0FDF4"}
+        for r,q in enumerate(queries,2):
+            vals=[q["id"],q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
+                  q["type"],q["status"],q["priority"],q["desc"],q["opened"],
+                  q.get("chase_date",""),q.get("resolved_date",""),q["log"],
+                  q["address"],q["spid"],q["serial"],q["contact"],q["prop_code"],
+                  q.get("last_by",""),q.get("last_date",""),q.get("assigned_to",""),
+                  q.get("raised_date","")]
+            for c,v in enumerate(vals,1):
+                cell=ws.cell(row=r,column=c,value=v)
+                cell.font=Font(name=FONT,size=10)
+                cell.alignment=Alignment(vertical="top",wrap_text=(c in (11,15))); cell.border=bdr
+            ws.cell(row=r,column=9).fill=PatternFill("solid",fgColor=sfills.get(q["status"],"FFFFFF"))
+            ws.cell(row=r,column=10).fill=PatternFill("solid",fgColor=pfills.get(q["priority"],"FFFFFF"))
+        ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:{get_column_letter(len(COLS))}1"
+        ds=wb.create_sheet("Dashboard",1); ds.sheet_view.showGridLines=False
+        ds["A1"]="Query Tracker — Dashboard"
+        ds["A1"].font=Font(bold=True,size=14,name=FONT,color="0F1B2D")
+        ds["A2"]=f"Last updated: {date.today().strftime('%d/%m/%Y')}"
+        ds["A2"].font=Font(size=10,name=FONT,color="6B7280")
+        today=today_str()
+        stats=[("Total",len(queries)),("Open",sum(1 for q in queries if q["status"]!="Resolved")),
+               ("Resolved",sum(1 for q in queries if q["status"]=="Resolved")),
+               ("Action today",sum(1 for q in queries if q["status"]!="Resolved" and q.get("chase_date","")<=today and q.get("chase_date","")))]
+        for i,(lbl,val) in enumerate(stats):
+            col=i*2+1
+            ds.cell(row=4,column=col,value=lbl).font=Font(name=FONT,size=9,color="6B7280")
+            ds.cell(row=5,column=col,value=val).font=Font(name=FONT,size=18,bold=True,
+                color="DC2626" if lbl=="Action today" and val>0 else "0F1B2D")
+            ds.column_dimensions[get_column_letter(col)].width=18
+        tmp=f"{excel_file}.tmp"
+        wb.save(tmp)
+        os.replace(tmp,excel_file)
+    finally:
+        _release_excel_lock(lock_fd, lock_path)
 
 def apply_styles():
     style=ttk.Style(); style.theme_use("clam")
@@ -1195,7 +1258,8 @@ def scrollable_frame(parent):
             if _ignore_combobox_wheel(e)=="break":
                 return "break"
 
-            pointed = canvas.winfo_containing(e.x_root, e.y_root)
+            px,py=canvas.winfo_pointerxy()
+            pointed = canvas.winfo_containing(px, py)
             if pointed is None:
                 return
             if not (_is_descendant(pointed, inner) or _is_descendant(pointed, canvas)):
@@ -1295,10 +1359,12 @@ def list_attachments(sites_file, q):
 
     return files
 
-def save_attachment(sites_file, q, src_path):
+def save_attachment(sites_file, q, src_path, src_name=None):
     folder=get_attachment_folder(sites_file,q)
     if not folder: return None,None
-    fname=os.path.basename(src_path)
+    fname=(src_name or os.path.basename(src_path) or "attachment").strip()
+    if fname.lower().endswith(".qbclaim"):
+        fname=fname[:-len(".qbclaim")]
     dest=os.path.join(folder,fname)
     base,ext=os.path.splitext(fname)
     counter=1
@@ -2669,6 +2735,25 @@ class QueryTrackerApp(tk.Tk):
         self.tree.bind("<Double-1>",self._open_detail)
         self.tree.bind("<Control-c>", self._copy_selected_rows)
         self.tree.bind("<Control-C>", self._copy_selected_rows)
+        self._tree_menu=tk.Menu(self,tearoff=0)
+        self._tree_menu.add_command(label="Copy selected rows",command=lambda:self._copy_selected_rows())
+        self._tree_menu.add_command(label="Copy reference",command=self._copy_selected_reference)
+        def _show_tree_menu(e):
+            iid=self.tree.identify_row(e.y)
+            if iid:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+            try:
+                self._tree_menu.tk_popup(e.x_root,e.y_root)
+            finally:
+                self._tree_menu.grab_release()
+        self.tree.bind("<Button-3>",_show_tree_menu)
+
+        if not getattr(self,"_global_wheel_bound",False):
+            self.bind_all("<MouseWheel>",self._on_global_wheel,add="+")
+            self.bind_all("<Button-4>",self._on_global_wheel,add="+")
+            self.bind_all("<Button-5>",self._on_global_wheel,add="+")
+            self._global_wheel_bound=True
 
         sbar=tk.Frame(lp,bg=NAV2,pady=6); sbar.pack(fill="x",side="bottom")
         tk.Frame(lp,bg=BORDER,height=1).pack(fill="x",side="bottom")
@@ -2732,6 +2817,59 @@ class QueryTrackerApp(tk.Tk):
             return self.focus_displayof() is not None
         except Exception:
             return False
+
+    def _is_descendant_widget(self, widget, ancestor):
+        w=widget
+        while w is not None:
+            if w==ancestor:
+                return True
+            w=getattr(w,"master",None)
+        return False
+
+    def _wheel_delta(self, e):
+        if getattr(e,"num",None)==4:
+            return -1
+        if getattr(e,"num",None)==5:
+            return 1
+        if getattr(e,"delta",0):
+            return int(-1*(e.delta/120))
+        return 0
+
+    def _on_global_wheel(self, e):
+        try:
+            if _ignore_combobox_wheel(e)=="break":
+                return "break"
+            if getattr(self,"_current_page","")!="list":
+                return
+            px,py=self.winfo_pointerxy()
+            pointed=self.winfo_containing(px,py)
+            if pointed is None:
+                return
+            if pointed.winfo_toplevel()!=self:
+                return
+            if not self._is_descendant_widget(pointed,self.list_page):
+                return
+            delta=self._wheel_delta(e)
+            if not delta:
+                return
+            self.tree.yview_scroll(delta,"units")
+            return "break"
+        except Exception:
+            return
+
+    def _copy_selected_reference(self):
+        sel=self.tree.selection()
+        if not sel:
+            return
+        vals=self.tree.item(sel[0],"values")
+        if not vals:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(str(vals[0]))
+            self.update_idletasks()
+        except Exception:
+            pass
 
     def _schedule_list_refresh(self, delay_ms=120):
         try:
@@ -4768,7 +4906,7 @@ class QueryTrackerApp(tk.Tk):
 
     def _file_to_query(self, fpath, fname, q):
         try:
-            dest_name, dest = save_attachment(self.sites_file, q, fpath)
+            dest_name, dest = save_attachment(self.sites_file, q, fpath, src_name=fname)
             if dest_name:
                 os.remove(fpath)
                 self._att_count_cache.pop(q.get("id",""),None)
@@ -4998,13 +5136,26 @@ class QueryTrackerApp(tk.Tk):
     def _refresh_metrics(self):
         for w in self.metrics_frame.winfo_children(): w.destroy()
         today=today_str()
-        chase_n=sum(1 for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today)
+        af=getattr(self,"_assignee_filter","")
+        fa=getattr(self,"filter_assignee",None)
+        fa_val=fa.get() if fa is not None else "All"
+        day_filter=getattr(self,"_calendar_day_filter","")
+        source=[]
+        for q in self.queries:
+            if af and q.get("assigned_to","")!=af:
+                continue
+            if fa_val!="All" and q.get("assigned_to","")!=fa_val:
+                continue
+            if day_filter and q.get("chase_date","")!=day_filter:
+                continue
+            source.append(q)
+        chase_n=sum(1 for q in source if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today)
         
         metrics = [
-            ("Total queries",  len(self.queries),                                          ACCENT,      None),
-            ("Open",           sum(1 for q in self.queries if q["status"]!="Resolved"),    ACCENT2,     "open"),
+            ("Total queries",  len(source),                                                ACCENT,      None),
+            ("Open",           sum(1 for q in source if q["status"]!="Resolved"),          ACCENT2,     "open"),
             ("Action today",    chase_n,                                                    DANGER if chase_n else MUTED,  "action"),
-            ("Resolved",       sum(1 for q in self.queries if q["status"]=="Resolved"),    SUCCESS,     "resolved")
+            ("Resolved",       sum(1 for q in source if q["status"]=="Resolved"),          SUCCESS,     "resolved")
         ]
         
         for label, val, color, tab_val in metrics:
@@ -5108,7 +5259,13 @@ class QueryTrackerApp(tk.Tk):
                 if getattr(self,"_save_pending",False) or getattr(self,"_save_in_progress",False):
                     self.after(1200, mark_read)
                     return
+                lock_fd=None
+                lock_path=None
                 try:
+                    lock_fd, lock_path = _acquire_excel_lock(self.excel_file, timeout=3.0)
+                    if lock_fd is None:
+                        self.after(1200, mark_read)
+                        return
                     wb2=openpyxl.load_workbook(self.excel_file)
                     if "_Notifications" in wb2.sheetnames:
                         nws2=wb2["_Notifications"]
@@ -5123,6 +5280,8 @@ class QueryTrackerApp(tk.Tk):
                     return
                 except Exception:
                     pass
+                finally:
+                    _release_excel_lock(lock_fd, lock_path)
                 nd.destroy()
                 self._refresh_list_if_visible()
 
@@ -6506,6 +6665,12 @@ class QueryTrackerApp(tk.Tk):
                         sz=os.path.getsize(fpath)
                         sz_str=f"{sz//1024}KB" if sz>1024 else f"{sz}B"
                     except: sz_str=""
+                    try:
+                        added_dt=datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%d/%m/%y %H:%M")
+                    except Exception:
+                        added_dt=""
+                    if added_dt:
+                        tk.Label(row,text=added_dt,font=(FONT,8),bg=CARD2,fg=MUTED,width=14).pack(side="right",padx=(0,8))
                     tk.Label(row,text=sz_str,font=(FONT,8),bg=CARD2,fg=MUTED,width=8).pack(side="right",padx=(0,4))
                     def rm(fp=fpath,fn=fname):
                         if messagebox.askyesno("Remove attachment",
@@ -6601,9 +6766,11 @@ class QueryTrackerApp(tk.Tk):
                 return
             if messagebox.askyesno("Delete",f"Delete {live_q['ref']}? This cannot be undone.",parent=dlg):
                 self.queries=[x for x in self.queries if x["id"]!=live_q["id"]]
+                self._att_count_cache.pop(live_q.get("id",""),None)
+                self.recent_ids=[rid for rid in self.recent_ids if rid!=live_q.get("id")]
                 if not self._save_queries():
                     return
-                self._refresh_table(); self._show_daily_banner(); dlg.destroy()
+                self._refresh_list_if_visible(); dlg.destroy()
 
         def change_type():
             """Close this query and spawn a new linked one of a different type."""
@@ -6700,8 +6867,9 @@ class QueryTrackerApp(tk.Tk):
             new_chase=chase_var.get().strip()
             assignee=assignee_var_d.get().strip()
             if assignee=="(Unassigned)": assignee=""
-            if not self._confirm_high_volume_day(new_chase, exclude_ids=[live_q.get("id")], add_count=1, parent=dlg, assignee=assignee):
-                return
+            if status_var.get()!="Resolved":
+                if not self._confirm_high_volume_day(new_chase, exclude_ids=[live_q.get("id")], add_count=1, parent=dlg, assignee=assignee):
+                    return
             old_desc=(live_q.get("desc", "") or "").strip()
             new_desc=desc_box.get("1.0","end").strip()
             pending_note=note_box.get("1.0","end").strip()
@@ -6931,8 +7099,16 @@ class QueryTrackerApp(tk.Tk):
                         nws.cell(row=next_row,column=1,value=notif_text)
                         nws.cell(row=next_row,column=2,value="N")
 
-                        # Save target workbook
-                        target_wb.save(tfile)
+                        # Save target workbook under lock
+                        t_lock_fd, t_lock_path = _acquire_excel_lock(tfile, timeout=10.0)
+                        if t_lock_fd is None:
+                            raise PermissionError("Destination tracker is currently being updated")
+                        try:
+                            t_tmp=f"{tfile}.tmp"
+                            target_wb.save(t_tmp)
+                            os.replace(t_tmp,tfile)
+                        finally:
+                            _release_excel_lock(t_lock_fd, t_lock_path)
 
                         # ── 5. Handle original query based on user's choice ───
                         if resolve_original:
@@ -7072,8 +7248,7 @@ class QueryTrackerApp(tk.Tk):
         make_btn(frow2,"✉ Email",draft_email,"default",padx=10,pady=5).pack(side="left",padx=(6,0))
         make_btn(frow2,"⧉ Duplicate",lambda:self._dup_query(q,dlg),"default",padx=10,pady=5).pack(side="left",padx=(6,0))
         make_btn(frow2,"⇄ Change type",change_type,"default",padx=10,pady=5).pack(side="left",padx=(6,0))
-        if getattr(self,"linked_trackers",[]):
-            make_btn(frow2,"↗ Transfer",transfer_query,"default",padx=10,pady=5).pack(side="left",padx=(6,0))
+        make_btn(frow2,"↗ Transfer",transfer_query,"default",padx=10,pady=5).pack(side="left",padx=(6,0))
         if is_chained or re.search(r"Continued from [A-Z]{2}-\d+",q.get("log","")):
             make_btn(frow2,"⏱ Timeline",show_timeline,"active",padx=10,pady=5).pack(side="left",padx=(6,0))
 
