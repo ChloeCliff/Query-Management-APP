@@ -265,6 +265,58 @@ def _ensure_app_folders():
     for folder in (DEFAULT_DATA_DIR, DEFAULT_BACKUP_DIR, DEFAULT_ATTACH_DIR):
         os.makedirs(folder, exist_ok=True)
 
+def auto_discover_paths(cfg):
+    """Auto-fill excel_file and sites_file in cfg from files next to the app.
+
+    Search order for tracker:
+      1. Data/query_tracker.xlsx  (default location)
+      2. Any single *.xlsx in Data/ that is not sites*.xlsx
+      3. Any *.xlsx next to the exe that contains 'tracker' or 'queries' in name
+    Search order for sites:
+      1. sites.xlsx next to the exe
+      2. Data/sites.xlsx
+      3. Any single *.xlsx next to the exe that contains 'site' in name
+
+    Only fills a key when it is missing OR points to a path that no longer exists.
+    """
+    def _needs_fill(key):
+        v = cfg.get(key, "").strip()
+        return not v or not os.path.exists(v)
+
+    if _needs_fill("excel_file"):
+        candidates = []
+        # 1. default path
+        if os.path.exists(DEFAULT_EXCEL_FILE):
+            candidates.append(DEFAULT_EXCEL_FILE)
+        # 2. any xlsx in Data/ that isn't a sites file
+        if os.path.isdir(DEFAULT_DATA_DIR):
+            for fn in os.listdir(DEFAULT_DATA_DIR):
+                if fn.lower().endswith(".xlsx") and "site" not in fn.lower():
+                    candidates.append(os.path.join(DEFAULT_DATA_DIR, fn))
+        # 3. xlsx next to exe with tracker/queries in name
+        for fn in os.listdir(APP_DIR):
+            if fn.lower().endswith(".xlsx") and any(k in fn.lower() for k in ("tracker","queries","query")):
+                candidates.append(os.path.join(APP_DIR, fn))
+        if candidates:
+            cfg["excel_file"] = candidates[0]
+
+    if _needs_fill("sites_file"):
+        candidates = []
+        # 1. sites.xlsx next to exe
+        p = os.path.join(APP_DIR, "sites.xlsx")
+        if os.path.exists(p): candidates.append(p)
+        # 2. Data/sites.xlsx
+        p2 = os.path.join(DEFAULT_DATA_DIR, "sites.xlsx")
+        if os.path.exists(p2): candidates.append(p2)
+        # 3. any xlsx with 'site' in name next to exe
+        for fn in os.listdir(APP_DIR):
+            if fn.lower().endswith(".xlsx") and "site" in fn.lower():
+                candidates.append(os.path.join(APP_DIR, fn))
+        if candidates:
+            cfg["sites_file"] = candidates[0]
+
+    return cfg
+
 def _ensure_config_folder():
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
@@ -2431,9 +2483,14 @@ class QueryTrackerApp(tk.Tk):
         
         apply_styles()
         self.cfg=load_config()
+        # Auto-discover tracker and sites from the app folder so the app works
+        # straight away when opened from a SharePoint folder without any config.
+        self.cfg = auto_discover_paths(self.cfg)
         self._watcher_running=False
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        if not self.cfg.get("excel_file") or not self.cfg.get("username"):
+        # Only show setup wizard if username is still missing — paths are now
+        # auto-filled so path absence alone no longer requires the wizard.
+        if not self.cfg.get("username"):
             self._run_wizard(first_run=True)
         else:
             self._launch()
