@@ -1781,6 +1781,7 @@ def _show_cal(parent,date_var,get_day_load=None,confirm_day_selection=None,high_
 class SetupWizard(tk.Toplevel):
     def __init__(self,parent,existing_cfg=None,on_complete=None):
         super().__init__(parent)
+        self._parent_app=parent
         self.title("Query Tracker — Settings")
         sw=self.winfo_screenwidth(); sh=self.winfo_screenheight()
         ww=min(980,max(760,sw-120)); wh=min(860,max(700,sh-120))
@@ -1805,8 +1806,8 @@ class SetupWizard(tk.Toplevel):
         content=tk.Frame(self,bg=BG); content.pack(fill="both",expand=True)
 
         for tab_id,tab_lbl in [("general","General"),("query_types","Query Types"),
-                                ("team","Team Members"),("trackers","Linked Trackers"),
-                                ("escalation","Escalation"),("theme","Theme")]:
+                    ("team","Team Members"),("trackers","Linked Trackers"),
+                    ("escalation","Escalation"),("sync","Sync Health"),("theme","Theme")]:
             f=tk.Frame(content,bg=BG); self._tab_frames[tab_id]=f
             btn=tk.Label(tab_bar,text=f"  {tab_lbl}  ",font=(FONT,10),bg=NAV2,
                          fg=NAV_MUTED,cursor="hand2",padx=6,pady=10)
@@ -2186,6 +2187,118 @@ class SetupWizard(tk.Toplevel):
         tk.Label(lt_body,text="  Tip: give each tracker a short name like 'Savills COT team' or 'Recharge inbox'",
                  font=(FONT,8),bg=BG,fg=MUTED).pack(anchor="w",pady=(4,0))
         self._current_trackers=current_trackers
+
+        # ── Sync Health tab ───────────────────────────────────────────────────
+        sync_frame=self._tab_frames["sync"]
+        sync_body=tk.Frame(sync_frame,bg=BG,padx=24,pady=16)
+        sync_body.pack(fill="both",expand=True)
+        tk.Label(sync_body,text="Sync health",font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w")
+        tk.Label(sync_body,
+                 text=("Live diagnostics for save/reload state.\n"
+                       "Use this before opening the tracker in Excel if sync looks stuck."),
+                 font=(FONT,9),bg=BG,fg=TEXT2,justify="left",wraplength=620).pack(anchor="w",pady=(4,10))
+
+        sync_card=tk.Frame(sync_body,bg=CARD2,highlightthickness=1,highlightbackground=BORDER,padx=14,pady=12)
+        sync_card.pack(fill="x")
+
+        sync_rows={}
+        for key,label in [
+            ("status","Status"),
+            ("save_queue","Save queue"),
+            ("retry","Retry count"),
+            ("lock","Lock signals"),
+            ("tracker","Tracker file"),
+            ("sites","Sites file"),
+            ("mtime","Last file stamp"),
+            ("recovery","Latest recovery snapshot"),
+        ]:
+            row=tk.Frame(sync_card,bg=CARD2)
+            row.pack(fill="x",pady=2)
+            tk.Label(row,text=label,font=(FONT,9),bg=CARD2,fg=MUTED,width=20,anchor="w").pack(side="left")
+            sv=tk.StringVar(value="—")
+            tk.Label(row,textvariable=sv,font=(FONT,9),bg=CARD2,fg=TEXT,anchor="w",justify="left",wraplength=500).pack(side="left",fill="x",expand=True)
+            sync_rows[key]=sv
+
+        hint=tk.Frame(sync_body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=8)
+        hint.pack(fill="x",pady=(10,0))
+        tk.Label(hint,
+                 text=("If Save queue is busy repeatedly, close the live tracker in Excel and wait for status to return to Live.\n"
+                       "Recovery snapshots are written to Data\\Backups during prolonged blocking."),
+                 font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=620).pack(anchor="w")
+
+        def _sync_health_refresh():
+            if not self.winfo_exists():
+                return
+            app=getattr(self,"_parent_app",None)
+            auto_excel, auto_sites = _auto_data_paths()
+            sync_rows["tracker"].set(auto_excel if os.path.exists(auto_excel) else f"Missing: {auto_excel}")
+            sync_rows["sites"].set(auto_sites if os.path.exists(auto_sites) else f"Missing: {auto_sites}")
+
+            if app is None:
+                sync_rows["status"].set("App context unavailable")
+                sync_rows["save_queue"].set("—")
+                sync_rows["retry"].set("—")
+                sync_rows["lock"].set("—")
+                sync_rows["mtime"].set("—")
+                sync_rows["recovery"].set("—")
+            else:
+                try:
+                    status_txt=app.sync_lbl.cget("text") if getattr(app,"sync_lbl",None) else "(no status label)"
+                except Exception:
+                    status_txt="(status unavailable)"
+                sync_rows["status"].set(status_txt)
+
+                sp=bool(getattr(app,"_save_pending",False))
+                si=bool(getattr(app,"_save_in_progress",False))
+                sync_rows["save_queue"].set(f"pending={sp}, in_progress={si}")
+                sync_rows["retry"].set(str(getattr(app,"_save_retry_count",0)))
+
+                lock_hints=[]
+                try:
+                    folder=os.path.dirname(auto_excel)
+                    base=os.path.basename(auto_excel)
+                    if os.path.exists(f"{auto_excel}.qblock"):
+                        lock_hints.append("qblock present")
+                    if os.path.exists(os.path.join(folder, f"~${base}")):
+                        lock_hints.append("Excel lock file present")
+                    try:
+                        names=os.listdir(folder)
+                        stem=os.path.splitext(base)[0].lower()
+                        if any(stem in n.lower() and ("conflict" in n.lower() or "conflicted" in n.lower()) for n in names):
+                            lock_hints.append("conflicted copy detected")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                sync_rows["lock"].set(", ".join(lock_hints) if lock_hints else "No obvious lock/conflict markers")
+
+                mt=getattr(app,"_excel_mtime",(0,0))
+                try:
+                    mtime=float(mt[0]) if isinstance(mt,(tuple,list)) else float(mt)
+                    size=int(mt[1]) if isinstance(mt,(tuple,list)) and len(mt)>1 else 0
+                    if mtime>0:
+                        mtxt=datetime.fromtimestamp(mtime).strftime("%d/%m/%Y %H:%M:%S")
+                        sync_rows["mtime"].set(f"{mtxt}  ·  {size:,} bytes")
+                    else:
+                        sync_rows["mtime"].set("No file timestamp yet")
+                except Exception:
+                    sync_rows["mtime"].set("Unavailable")
+
+                rec_text="No recovery snapshot found"
+                try:
+                    bdir=os.path.join(os.path.dirname(auto_excel),"Backups")
+                    if os.path.isdir(bdir):
+                        rec=[n for n in os.listdir(bdir) if n.startswith("query_tracker_recovery_") and n.lower().endswith(".xlsx")]
+                        if rec:
+                            rec.sort(reverse=True)
+                            rec_text=os.path.join(bdir,rec[0])
+                except Exception:
+                    pass
+                sync_rows["recovery"].set(rec_text)
+
+            self.after(2000,_sync_health_refresh)
+
+        _sync_health_refresh()
 
         # ── Theme tab ─────────────────────────────────────────────────────────
         th_frame=self._tab_frames["theme"]
