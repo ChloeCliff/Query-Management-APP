@@ -931,44 +931,108 @@ def load_site_data(sites_file):
     #   • dashes, asterisks, or is blank
     # A row is a DATA row when column A looks like an actual client name
     # AND column D (site name) is non-empty and doesn't look like a header.
-    header_fragments = {
-        "client","fund","site","address","utility","meter","contact",
-        "property","prop","must be","note:","example","column","—","*",
-        "managing","agent","spid","serial","instruction","please","name",
-        "town","postcode"
+    # Keep header detection conservative. Overly broad substring matching can
+    # misclassify real client/site names (for example values containing words
+    # like "name" or "site") and lead to 0 rows being loaded.
+    header_exact = {
+        "client","fund","site","address","address 1","town","postcode",
+        "utility","meter","contact","property","prop code","spid","serial",
+        "managing agent contact"
+    }
+    header_contains = {
+        "must be","note:","example","instruction","please","column "
     }
 
     def looks_like_header(val):
         if not val: return True
         s = str(val).strip().lower()
         if not s or s in ("", "-", "—", "*"): return True
-        return any(frag in s for frag in header_fragments)
+        if s in header_exact:
+            return True
+        return any(frag in s for frag in header_contains)
 
-    data_start_row = 1
-    for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
-        col_a = row[0] if row else None
-        col_d = row[3] if len(row) > 3 else None
-        # Skip if col A looks like a header/instruction
-        if looks_like_header(col_a):
-            data_start_row += 1
-            continue
-        # Skip if col D (site) is missing or looks like a header
-        if looks_like_header(col_d):
-            data_start_row += 1
-            continue
-        break  # found first real data row
+    def norm_header(v):
+        s = str(v or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    aliases = {
+        "client": {"client"},
+        "fund": {"fund"},
+        "prop_code": {"property code", "prop code", "property", "prop"},
+        "site": {"site", "site name"},
+        "address1": {"address 1", "address", "site address", "address line 1"},
+        "town": {"town", "city", "town / city"},
+        "postcode": {"postcode", "post code", "zip", "zip code"},
+        "utility": {"utility", "utility type"},
+        "spid": {"supply point id", "spid", "supply point"},
+        "serial": {"meter serial", "serial", "meter"},
+        "contact": {"managing agent contact", "contact", "agent contact"},
+    }
+
+    header_map = None
+    header_row = None
+    best_score = -1
+    for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True), start=1):
+        local = {}
+        for idx, cell in enumerate(row):
+            nh = norm_header(cell)
+            if not nh:
+                continue
+            for key, vals in aliases.items():
+                if nh in vals and key not in local:
+                    local[key] = idx
+        score = len(local)
+        if score > best_score and "client" in local and "site" in local:
+            best_score = score
+            header_map = local
+            header_row = r_i
+
+    if header_map:
+        data_start_row = (header_row or 1) + 1
+    else:
+        data_start_row = 1
+        for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
+            col_a = row[0] if row else None
+            col_d = row[3] if len(row) > 3 else None
+            if looks_like_header(col_a):
+                data_start_row += 1
+                continue
+            if looks_like_header(col_d):
+                data_start_row += 1
+                continue
+            break
 
     for row in ws.iter_rows(min_row=data_start_row, values_only=True):
-        if not row[0]: continue
-        col_a = str(row[0]).strip()
-        if looks_like_header(col_a): continue  # skip any stray header rows mid-sheet
         n=len(row)
-        def gv(i): return str(row[i] or "").strip() if i<n else ""
-        client=col_a
-        fund=gv(1); prop_code=gv(2); site_name=gv(3)
-        address1=gv(4); town=gv(5); postcode=gv(6); utility=gv(7); spid=gv(8); serial=gv(9); contact=gv(10)
-        if not site_name: continue
-        if looks_like_header(site_name): continue
+        def gv(i): return str(row[i] or "").strip() if (i is not None and i<n) else ""
+
+        if header_map:
+            client=gv(header_map.get("client"))
+            fund=gv(header_map.get("fund"))
+            prop_code=gv(header_map.get("prop_code"))
+            site_name=gv(header_map.get("site"))
+            address1=gv(header_map.get("address1"))
+            town=gv(header_map.get("town"))
+            postcode=gv(header_map.get("postcode"))
+            utility=gv(header_map.get("utility"))
+            spid=gv(header_map.get("spid"))
+            serial=gv(header_map.get("serial"))
+            contact=gv(header_map.get("contact"))
+        else:
+            if not row or not row[0]:
+                continue
+            col_a = str(row[0]).strip()
+            if looks_like_header(col_a):
+                continue
+            client=col_a
+            fund=gv(1); prop_code=gv(2); site_name=gv(3)
+            address1=gv(4); town=gv(5); postcode=gv(6); utility=gv(7); spid=gv(8); serial=gv(9); contact=gv(10)
+
+        if not client or not site_name:
+            continue
+        if looks_like_header(client) or looks_like_header(site_name):
+            continue
         if client not in clients: clients.append(client)
         sites_by_client.setdefault(client,[])
         if site_name not in sites_by_client[client]: sites_by_client[client].append(site_name)
