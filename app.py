@@ -2,6 +2,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os, json, shutil, subprocess, sys, tempfile, threading, re
+import hashlib
 from datetime import date, datetime, timedelta
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -228,7 +229,29 @@ RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__
 # Store user-specific settings locally so teammates do not overwrite each
 # other's name/path settings when they all run the same shared exe.
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "QBOX")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+SHARED_CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "qbox.config.json")
+_cfg_override = (os.environ.get("QBOX_CONFIG_FILE") or "").strip()
+if _cfg_override:
+    CONFIG_FILE = _cfg_override
+else:
+    _cfg_profile = (os.environ.get("QBOX_CONFIG_PROFILE") or "").strip()
+    if not re.match(r"^[A-Za-z0-9_-]+$", _cfg_profile):
+        _cfg_profile = ""
+    if _cfg_profile:
+        CONFIG_FILE = os.path.join(CONFIG_DIR, f"config.{_cfg_profile}.json")
+    elif os.path.isdir(APP_DIR) and os.access(APP_DIR, os.W_OK):
+        # Best default for copied app folders: keep settings next to that app
+        # so tenant/client app copies never overwrite each other.
+        CONFIG_FILE = LOCAL_CONFIG_FILE
+    else:
+        # Default: isolate local settings by app location so different copied
+        # app instances (different SharePoint/client folders) don't overwrite
+        # each other.
+        _app_key_src = os.path.normcase(os.path.abspath(APP_DIR))
+        _app_key_hash = hashlib.sha1(_app_key_src.encode("utf-8")).hexdigest()[:10]
+        _app_name = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.basename(APP_DIR) or "qbox")
+        CONFIG_FILE = os.path.join(CONFIG_DIR, f"config.{_app_name}.{_app_key_hash}.json")
 LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 # Default data paths — created automatically so the team never has to browse
@@ -452,6 +475,15 @@ def load_config():
         try:
             with open(CONFIG_FILE) as f: return json.load(f)
         except: pass
+    # One-time fallback from the old shared local config path.
+    if CONFIG_FILE != SHARED_CONFIG_FILE and os.path.exists(SHARED_CONFIG_FILE):
+        try:
+            with open(SHARED_CONFIG_FILE) as f:
+                cfg=json.load(f)
+            save_config(cfg)
+            return cfg
+        except:
+            pass
     if os.path.exists(LEGACY_CONFIG_FILE):
         try:
             with open(LEGACY_CONFIG_FILE) as f:
@@ -1737,6 +1769,14 @@ class SetupWizard(tk.Toplevel):
         self.sites_var=path_row("Site list (sites.xlsx)",
             "Point to your sites.xlsx in the same shared folder.","sites_file")
 
+        cfg_card=tk.Frame(body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=8)
+        cfg_card.pack(fill="x",pady=(10,0))
+        tk.Label(cfg_card,
+                 text=("Active local settings file:\n"
+                       f"{CONFIG_FILE}\n\n"
+                       "If you keep separate app copies per tracker/client, each copy should show a different settings file."),
+                 font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=520).pack(anchor="w")
+
         def test_sites():
             """Load the sites file right now and show what was found — for diagnosing issues."""
             sf=self.sites_var.get().strip()
@@ -2296,6 +2336,8 @@ class SetupWizard(tk.Toplevel):
             self.destroy()
             if self.on_complete: self.on_complete(self.cfg)
         else:
+            if self.on_complete:
+                self.on_complete(self.cfg)
             messagebox.showinfo("Applied","Settings updated successfully.",parent=self)
         if theme_changed:
             messagebox.showinfo("Theme changed",
