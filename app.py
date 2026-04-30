@@ -2632,6 +2632,7 @@ class QueryTrackerApp(tk.Tk):
         self._save_in_progress=False
         self._save_retry_after_id=None
         self._save_retry_count=0
+        self._save_conflict_snapshot_done=False
         self._build_ui(); self.deiconify()
         self._refresh_table(); self._show_daily_banner()
         self._start_auto_reload()
@@ -5856,6 +5857,24 @@ class QueryTrackerApp(tk.Tk):
         self._flush_save_queue()
         return True
 
+    def _save_recovery_snapshot(self, reason=""):
+        """Write a timestamped recovery copy of in-memory queries.
+
+        Used during prolonged file-busy/version conflicts so users can keep
+        working without opening the live workbook.
+        """
+        try:
+            if not self.excel_file:
+                return None
+            bdir=os.path.join(os.path.dirname(self.excel_file), "Backups")
+            os.makedirs(bdir, exist_ok=True)
+            ts=datetime.now().strftime("%Y%m%d_%H%M%S")
+            out=os.path.join(bdir, f"query_tracker_recovery_{ts}.xlsx")
+            save_all_queries(self.queries, out)
+            return out
+        except Exception:
+            return None
+
     def _schedule_save_retry(self, delay_ms=3000):
         try:
             if self._save_retry_after_id:
@@ -5874,6 +5893,7 @@ class QueryTrackerApp(tk.Tk):
             save_all_queries(self.queries,self.excel_file)
             self._save_pending=False
             self._save_retry_count=0
+            self._save_conflict_snapshot_done=False
             self._excel_mtime=self._excel_mtime_now()
             try:
                 self.sync_lbl.config(text="✓ Saved")
@@ -5882,6 +5902,21 @@ class QueryTrackerApp(tk.Tk):
                 pass
         except PermissionError:
             self._save_retry_count += 1
+            hints=[]
+            try:
+                folder=os.path.dirname(self.excel_file)
+                base=os.path.basename(self.excel_file)
+                if os.path.exists(os.path.join(folder, f"~${base}")):
+                    hints.append("Excel lock file")
+                try:
+                    names=os.listdir(folder)
+                    stem=os.path.splitext(base)[0].lower()
+                    if any(stem in n.lower() and ("conflict" in n.lower() or "conflicted" in n.lower()) for n in names):
+                        hints.append("conflicted copy detected")
+                except Exception:
+                    pass
+            except Exception:
+                pass
             if self._save_retry_count == 1:
                 _show_toast(
                     self,
@@ -5890,7 +5925,13 @@ class QueryTrackerApp(tk.Tk):
                     color=WARNING,
                     duration=6500,
                 )
-            try: self.sync_lbl.config(text="… Save queued (file busy)")
+            if self._save_retry_count >= 5 and not getattr(self,"_save_conflict_snapshot_done",False):
+                snap=self._save_recovery_snapshot("file busy")
+                self._save_conflict_snapshot_done=True
+                if snap:
+                    _show_toast(self,f"Recovery snapshot saved:\n{os.path.basename(snap)}",color="#1A2E48",duration=7000)
+            suffix=f"  ·  {'; '.join(hints)}" if hints else ""
+            try: self.sync_lbl.config(text=f"… Save queued (busy x{self._save_retry_count}){suffix}")
             except Exception: pass
             # Back off slightly under lock contention to reduce sync churn.
             retry_ms=min(12000, 3000 + max(0, self._save_retry_count-1)*1000)
