@@ -230,7 +230,7 @@ RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__
 # other's name/path settings when they all run the same shared exe.
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "QBOX")
 SHARED_CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "qbox.config.json")
+OLD_LOCAL_CONFIG_FILE = os.path.join(APP_DIR, "qbox.config.json")
 _cfg_override = (os.environ.get("QBOX_CONFIG_FILE") or "").strip()
 if _cfg_override:
     CONFIG_FILE = _cfg_override
@@ -240,10 +240,6 @@ else:
         _cfg_profile = ""
     if _cfg_profile:
         CONFIG_FILE = os.path.join(CONFIG_DIR, f"config.{_cfg_profile}.json")
-    elif os.path.isdir(APP_DIR) and os.access(APP_DIR, os.W_OK):
-        # Best default for copied app folders: keep settings next to that app
-        # so tenant/client app copies never overwrite each other.
-        CONFIG_FILE = LOCAL_CONFIG_FILE
     else:
         # Default: isolate local settings by app location so different copied
         # app instances (different SharePoint/client folders) don't overwrite
@@ -278,11 +274,21 @@ def _ensure_app_folders():
 def _ensure_config_folder():
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
+def _cleanup_old_local_config():
+    # Legacy local config next to the app can cause sync/merge conflicts in
+    # shared folders. We no longer use this location.
+    try:
+        if os.path.exists(OLD_LOCAL_CONFIG_FILE):
+            os.remove(OLD_LOCAL_CONFIG_FILE)
+    except Exception:
+        pass
+
 def resource_path(*parts):
     return os.path.join(RESOURCE_DIR, *parts)
 
 _ensure_app_folders()
 _ensure_config_folder()
+_cleanup_old_local_config()
 
 DEFAULT_QUERY_TYPES = [
     "Sub-Meter reads","Tenancy change","Recharge rework","New instruction",
@@ -483,13 +489,20 @@ P_COLORS = {
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE) as f: return json.load(f)
+            with open(CONFIG_FILE) as f:
+                cfg=json.load(f)
+            # Paths are always auto-resolved from Data/ and are not persisted.
+            cfg.pop("excel_file", None)
+            cfg.pop("sites_file", None)
+            return cfg
         except: pass
     # One-time fallback from the old shared local config path.
     if CONFIG_FILE != SHARED_CONFIG_FILE and os.path.exists(SHARED_CONFIG_FILE):
         try:
             with open(SHARED_CONFIG_FILE) as f:
                 cfg=json.load(f)
+            cfg.pop("excel_file", None)
+            cfg.pop("sites_file", None)
             save_config(cfg)
             return cfg
         except:
@@ -498,6 +511,8 @@ def load_config():
         try:
             with open(LEGACY_CONFIG_FILE) as f:
                 cfg=json.load(f)
+            cfg.pop("excel_file", None)
+            cfg.pop("sites_file", None)
             save_config(cfg)
             return cfg
         except:
@@ -2440,9 +2455,10 @@ class SetupWizard(tk.Toplevel):
                 "High-volume warning threshold must be a whole number greater than 0.",parent=self); return
         chosen_theme=getattr(self,"_selected_theme",None)
         chosen_theme=chosen_theme.get() if chosen_theme else self.cfg.get("theme","Slate & Teal")
+        # Paths are not stored in local config; app always resolves Data/ paths.
+        self.cfg.pop("excel_file", None)
+        self.cfg.pop("sites_file", None)
         self.cfg.update({
-            "excel_file":     excel,
-            "sites_file":     self.sites_var.get().strip() or auto_sites,
             "username":       name,
             "high_volume_threshold": hvt,
             "query_types":    self._current_types,
@@ -2495,15 +2511,6 @@ class QueryTrackerApp(tk.Tk):
         self.cfg=load_config()
         self._watcher_running=False
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Always auto-resolve paths from the Data/ folder next to the app.
-        # This means no path setup is needed — the app works from any location.
-        auto_excel, auto_sites = _auto_data_paths()
-        # Only override saved paths if they are blank or the saved path no
-        # longer exists (e.g. user moved the app to a new machine/folder).
-        if not self.cfg.get("excel_file") or not os.path.exists(self.cfg.get("excel_file","")):
-            self.cfg["excel_file"] = auto_excel
-        if not self.cfg.get("sites_file") or not os.path.exists(self.cfg.get("sites_file","")):
-            self.cfg["sites_file"] = auto_sites
         # Only ask for username if not already set — paths no longer required.
         if not self.cfg.get("username"):
             self._run_wizard(first_run=True)
@@ -2662,8 +2669,7 @@ class QueryTrackerApp(tk.Tk):
         global QUERY_TYPES
         self.username=self.cfg.get("username","Unknown")
         self.login_name=(os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
-        self.excel_file=self.cfg.get("excel_file","")
-        self.sites_file=self.cfg.get("sites_file","")
+        self.excel_file,self.sites_file=_auto_data_paths()
         # Load query types and team members from the shared tracker so all
         # teammates automatically pick up any changes made by others.
         shared=load_shared_settings(self.excel_file)
@@ -3686,6 +3692,17 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
                     self._set_tab("action", refresh=False)
 
+                def sync_action_today_views():
+                    # Keep all Action-today widgets aligned with the selected person filter.
+                    try: self._refresh_metrics()
+                    except: pass
+                    try: self._show_daily_banner()
+                    except: pass
+                    try:
+                        if getattr(self, "_mini_refresh", None):
+                            self._mini_refresh()
+                    except: pass
+
                 if getattr(self,"_assignee_filter","")==person:
                     self._assignee_filter=""  # toggle off — stay on dashboard
                     sync_list_filters("")
@@ -3696,6 +3713,7 @@ class QueryTrackerApp(tk.Tk):
                     self._dash_dirty=True
                     self.after_idle(self._refresh_dashboard)
                     self.after_idle(self._refresh_list_if_visible)
+                    self.after_idle(sync_action_today_views)
                 else:
                     self._assignee_filter=person
                     sync_list_filters(person)
@@ -3707,6 +3725,7 @@ class QueryTrackerApp(tk.Tk):
                     self._dash_dirty=True
                     self.after_idle(self._refresh_dashboard)
                     self.after_idle(self._refresh_list_if_visible)
+                    self.after_idle(sync_action_today_views)
 
             def _bind_click_tree(widget, on_click, on_enter, on_leave):
                 try:
@@ -3762,6 +3781,14 @@ class QueryTrackerApp(tk.Tk):
                     try: self.cal_member_var.set("All")
                     except: pass
                     self.after_idle(self._refresh_dashboard); self.after_idle(self._refresh_list_if_visible)
+                    try: self.after_idle(self._refresh_metrics)
+                    except: pass
+                    try: self.after_idle(self._show_daily_banner)
+                    except: pass
+                    try:
+                        if getattr(self, "_mini_refresh", None):
+                            self.after_idle(self._mini_refresh)
+                    except: pass
                 make_btn(tm_row,"✕ Clear person filter",clear_pf,"danger",padx=10,pady=6).pack(side="left",padx=(4,0))
 
         # Workload Balance removed from dashboard by request (TEAM section already covers this).
@@ -5428,14 +5455,23 @@ class QueryTrackerApp(tk.Tk):
 
     def _show_daily_banner(self):
         today=today_str()
-        items=[q for q in self.queries if q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today and not is_recurring_query(q)]
+        af=getattr(self,"_assignee_filter","")
+        items=[
+            q for q in self.queries
+            if q["status"]!="Resolved"
+            and q.get("chase_date","")
+            and q["chase_date"]<=today
+            and not is_recurring_query(q)
+            and (not af or q.get("assigned_to","")==af)
+        ]
         if items:
             preview=", ".join(f"{q['ref']} ({q['client']})" for q in items[:3])
             extra=f" +{len(items)-3} more" if len(items)>3 else ""
             tone=DANGER if len(items)>=3 else WARNING
             self.banner_strip.config(bg=tone)
             self.banner_frame.config(highlightbackground=tone)
-            self.banner_lbl.config(text=f"Action needed today  •  {len(items)} quer{'y' if len(items)==1 else 'ies'} require follow-up  •  {preview}{extra}")
+            who=f" for {af}" if af else ""
+            self.banner_lbl.config(text=f"Action needed today{who}  •  {len(items)} quer{'y' if len(items)==1 else 'ies'} require follow-up  •  {preview}{extra}")
             self.banner_frame.pack(fill="x",padx=20,pady=(12,0))
         else: self.banner_frame.pack_forget()
 
