@@ -4952,6 +4952,10 @@ class QueryTrackerApp(tk.Tk):
         """Reload queries from disk without disrupting any open dialogs."""
         try:
             if getattr(self,"_save_pending",False):
+                try:
+                    self.sync_lbl.config(text="… Refresh paused (save queued)")
+                except Exception:
+                    pass
                 return
             fresh=load_queries(self.excel_file)
             if fresh is not None:
@@ -5878,16 +5882,27 @@ class QueryTrackerApp(tk.Tk):
                 pass
         except PermissionError:
             self._save_retry_count += 1
+            if self._save_retry_count == 1:
+                _show_toast(
+                    self,
+                    "Save queued: close query_tracker.xlsx in Excel if open.\n"
+                    "Opening the live tracker during app edits can cause SharePoint version conflicts.",
+                    color=WARNING,
+                    duration=6500,
+                )
             try: self.sync_lbl.config(text="… Save queued (file busy)")
             except Exception: pass
-            self._schedule_save_retry(3000)
+            # Back off slightly under lock contention to reduce sync churn.
+            retry_ms=min(12000, 3000 + max(0, self._save_retry_count-1)*1000)
+            self._schedule_save_retry(retry_ms)
         except Exception as exc:
             self._save_retry_count += 1
             if self._save_retry_count <= 1:
                 _show_toast(self,f"Save queued: {exc}",color=WARNING,duration=4000)
             try: self.sync_lbl.config(text="… Save queued (retrying)")
             except Exception: pass
-            self._schedule_save_retry(3000)
+            retry_ms=min(12000, 3000 + max(0, self._save_retry_count-1)*1000)
+            self._schedule_save_retry(retry_ms)
         finally:
             self._save_in_progress=False
 
