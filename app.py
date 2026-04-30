@@ -254,68 +254,26 @@ else:
         CONFIG_FILE = os.path.join(CONFIG_DIR, f"config.{_app_name}.{_app_key_hash}.json")
 LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
-# Default data paths — created automatically so the team never has to browse
+# Default data paths — always resolved relative to the app folder so the app
+# works from any SharePoint/OneDrive location without path configuration.
 DEFAULT_DATA_DIR    = os.path.join(APP_DIR, "Data")
 DEFAULT_EXCEL_FILE  = os.path.join(DEFAULT_DATA_DIR, "query_tracker.xlsx")
+DEFAULT_SITES_FILE  = os.path.join(DEFAULT_DATA_DIR, "sites.xlsx")
 DEFAULT_BACKUP_DIR  = os.path.join(DEFAULT_DATA_DIR, "Backups")
 DEFAULT_ATTACH_DIR  = os.path.join(APP_DIR, "ATTACHMENTS")
+
+def _auto_data_paths():
+    """Return (excel_file, sites_file) resolved from Data/ next to the app.
+    Always prefer the real files when they exist so no manual path setup is
+    needed — the app just works wherever it is placed."""
+    excel = DEFAULT_EXCEL_FILE
+    sites = DEFAULT_SITES_FILE
+    return excel, sites
 
 def _ensure_app_folders():
     """Create Data/, Data/Backups/, and ATTACHMENTS/ next to the exe on first run."""
     for folder in (DEFAULT_DATA_DIR, DEFAULT_BACKUP_DIR, DEFAULT_ATTACH_DIR):
         os.makedirs(folder, exist_ok=True)
-
-def auto_discover_paths(cfg):
-    """Auto-fill excel_file and sites_file in cfg from files next to the app.
-
-    Search order for tracker:
-      1. Data/query_tracker.xlsx  (default location)
-      2. Any single *.xlsx in Data/ that is not sites*.xlsx
-      3. Any *.xlsx next to the exe that contains 'tracker' or 'queries' in name
-    Search order for sites:
-      1. sites.xlsx next to the exe
-      2. Data/sites.xlsx
-      3. Any single *.xlsx next to the exe that contains 'site' in name
-
-    Only fills a key when it is missing OR points to a path that no longer exists.
-    """
-    def _needs_fill(key):
-        v = cfg.get(key, "").strip()
-        return not v or not os.path.exists(v)
-
-    if _needs_fill("excel_file"):
-        candidates = []
-        # 1. default path
-        if os.path.exists(DEFAULT_EXCEL_FILE):
-            candidates.append(DEFAULT_EXCEL_FILE)
-        # 2. any xlsx in Data/ that isn't a sites file
-        if os.path.isdir(DEFAULT_DATA_DIR):
-            for fn in os.listdir(DEFAULT_DATA_DIR):
-                if fn.lower().endswith(".xlsx") and "site" not in fn.lower():
-                    candidates.append(os.path.join(DEFAULT_DATA_DIR, fn))
-        # 3. xlsx next to exe with tracker/queries in name
-        for fn in os.listdir(APP_DIR):
-            if fn.lower().endswith(".xlsx") and any(k in fn.lower() for k in ("tracker","queries","query")):
-                candidates.append(os.path.join(APP_DIR, fn))
-        if candidates:
-            cfg["excel_file"] = candidates[0]
-
-    if _needs_fill("sites_file"):
-        candidates = []
-        # 1. sites.xlsx next to exe
-        p = os.path.join(APP_DIR, "sites.xlsx")
-        if os.path.exists(p): candidates.append(p)
-        # 2. Data/sites.xlsx
-        p2 = os.path.join(DEFAULT_DATA_DIR, "sites.xlsx")
-        if os.path.exists(p2): candidates.append(p2)
-        # 3. any xlsx with 'site' in name next to exe
-        for fn in os.listdir(APP_DIR):
-            if fn.lower().endswith(".xlsx") and "site" in fn.lower():
-                candidates.append(os.path.join(APP_DIR, fn))
-        if candidates:
-            cfg["sites_file"] = candidates[0]
-
-    return cfg
 
 def _ensure_config_folder():
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1876,30 +1834,81 @@ class SetupWizard(tk.Toplevel):
             make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
             return var
 
-        # Only pre-fill the default path when there is no saved setting at all
-        # (i.e. very first launch). Do not overwrite a saved path from a previous session.
+        # ── Auto-path info ────────────────────────────────────────────────────
+        auto_excel, auto_sites = _auto_data_paths()
+        auto_card=tk.Frame(body,bg="#0F1E38",highlightthickness=1,highlightbackground="#1D3A6E",padx=12,pady=10)
+        auto_card.pack(fill="x",pady=(4,0))
+        tk.Label(auto_card,
+                 text="ℹ  Paths are resolved automatically from the Data\\ folder next to this app.",
+                 font=(FONT,9,"bold"),bg="#0F1E38",fg="#7DD3FC",justify="left").pack(anchor="w")
+        tk.Label(auto_card,
+                 text=(f"Query tracker:  {auto_excel}\n"
+                       f"Site list:          {auto_sites}\n\n"
+                       "No path setup needed. Just place query_tracker.xlsx and sites.xlsx\n"
+                       "inside the Data\\ folder next to the app and it will find them automatically."),
+                 font=(FONT,8),bg="#0F1E38",fg="#BAE6FD",justify="left",wraplength=520).pack(anchor="w",pady=(4,0))
+
+        # Advanced override — collapsed by default so it does not confuse users
+        adv_visible=[False]
+        adv_toggle=tk.Label(body,text="▶  Advanced: override file paths manually",
+                            font=(FONT,8),bg=BG,fg=MUTED,cursor="hand2")
+        adv_toggle.pack(anchor="w",pady=(10,0))
+        adv_frame=tk.Frame(body,bg=BG)
+
+        def _toggle_adv(*_):
+            if adv_visible[0]:
+                adv_frame.pack_forget()
+                adv_toggle.configure(text="▶  Advanced: override file paths manually")
+            else:
+                adv_frame.pack(fill="x",pady=(4,0))
+                adv_toggle.configure(text="▼  Advanced: override file paths manually")
+            adv_visible[0]=not adv_visible[0]
+        adv_toggle.bind("<Button-1>",_toggle_adv)
+
+        def path_row(label,note,key,save_mode=False,parent=adv_frame):
+            tk.Label(parent,text=label,font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w",pady=(12,2))
+            tk.Label(parent,text=note,font=(FONT,9),bg=BG,fg=TEXT2).pack(anchor="w")
+            row=tk.Frame(parent,bg=BG); row.pack(fill="x",pady=(6,0))
+            var=tk.StringVar(value=self.cfg.get(key,""))
+            card=tk.Frame(row,bg=CARD2,highlightthickness=1,highlightbackground=BORDER)
+            card.pack(side="left",fill="x",expand=True,padx=(0,10))
+            tk.Entry(card,textvariable=var,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,
+                     relief="flat",bd=8,highlightthickness=0).pack(fill="x")
+            def browse(v=var,sm=save_mode):
+                current=v.get().strip()
+                initial_dir=os.path.dirname(current) if current and os.path.dirname(current) else DEFAULT_DATA_DIR
+                if sm:
+                    p=filedialog.askopenfilename(title="Select your query_tracker.xlsx",
+                        initialdir=initial_dir,filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
+                else:
+                    p=filedialog.askopenfilename(title="Find sites.xlsx",
+                        initialdir=initial_dir,filetypes=[("Excel files","*.xlsx")])
+                if p: v.set(p)
+            make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
+            return var
+
         if not self.cfg.get("excel_file"):
-            self.cfg["excel_file"] = DEFAULT_EXCEL_FILE
+            self.cfg["excel_file"] = auto_excel
+        if not self.cfg.get("sites_file"):
+            self.cfg["sites_file"] = auto_sites
         self.excel_var=path_row("Query data file",
-            "Click Browse to select your shared query_tracker.xlsx. Your choice is remembered for next time.","excel_file",save_mode=True)
+            "Override the auto-detected tracker path (leave blank to use Data\\ folder).","excel_file",save_mode=True)
         self.sites_var=path_row("Site list (sites.xlsx)",
-            "Point to your sites.xlsx in the same shared folder.","sites_file")
+            "Override the auto-detected sites path (leave blank to use Data\\ folder).","sites_file")
 
         cfg_card=tk.Frame(body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=8)
         cfg_card.pack(fill="x",pady=(10,0))
         tk.Label(cfg_card,
-                 text=("Active local settings file:\n"
-                       f"{CONFIG_FILE}\n\n"
-                       "If you keep separate app copies per tracker/client, each copy should show a different settings file."),
+                 text=(f"Settings file: {CONFIG_FILE}"),
                  font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=520).pack(anchor="w")
 
         def test_sites():
             """Load the sites file right now and show what was found — for diagnosing issues."""
-            sf=self.sites_var.get().strip()
+            sf=self.sites_var.get().strip() or auto_sites
             if not sf:
-                messagebox.showwarning("No file set","Please choose a sites.xlsx file first.",parent=self); return
+                messagebox.showwarning("No file set","No sites.xlsx found in the Data\\ folder and no override set.",parent=self); return
             if not os.path.exists(sf):
-                messagebox.showerror("File not found",f"Cannot find:\n{sf}",parent=self); return
+                messagebox.showerror("File not found",f"Cannot find:\n{sf}\n\nPlace sites.xlsx in the Data\\ folder next to the app.",parent=self); return
             try:
                 import openpyxl as _opx
                 wb=_opx.load_workbook(sf,data_only=True)
@@ -2417,7 +2426,8 @@ class SetupWizard(tk.Toplevel):
                 btn.configure(fg=NAV_MUTED,font=(FONT,10),bg=NAV2)
 
     def _save(self, close_after=True):
-        excel=self.excel_var.get().strip(); name=self.name_var.get().strip()
+        auto_excel, auto_sites = _auto_data_paths()
+        excel=(self.excel_var.get().strip() or auto_excel); name=self.name_var.get().strip()
         if not excel:
             messagebox.showwarning("Required","Please choose a location for the query data file.",parent=self); return
         if not name:
@@ -2432,7 +2442,7 @@ class SetupWizard(tk.Toplevel):
         chosen_theme=chosen_theme.get() if chosen_theme else self.cfg.get("theme","Slate & Teal")
         self.cfg.update({
             "excel_file":     excel,
-            "sites_file":     self.sites_var.get().strip(),
+            "sites_file":     self.sites_var.get().strip() or auto_sites,
             "username":       name,
             "high_volume_threshold": hvt,
             "query_types":    self._current_types,
@@ -2483,13 +2493,18 @@ class QueryTrackerApp(tk.Tk):
         
         apply_styles()
         self.cfg=load_config()
-        # Auto-discover tracker and sites from the app folder so the app works
-        # straight away when opened from a SharePoint folder without any config.
-        self.cfg = auto_discover_paths(self.cfg)
         self._watcher_running=False
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Only show setup wizard if username is still missing — paths are now
-        # auto-filled so path absence alone no longer requires the wizard.
+        # Always auto-resolve paths from the Data/ folder next to the app.
+        # This means no path setup is needed — the app works from any location.
+        auto_excel, auto_sites = _auto_data_paths()
+        # Only override saved paths if they are blank or the saved path no
+        # longer exists (e.g. user moved the app to a new machine/folder).
+        if not self.cfg.get("excel_file") or not os.path.exists(self.cfg.get("excel_file","")):
+            self.cfg["excel_file"] = auto_excel
+        if not self.cfg.get("sites_file") or not os.path.exists(self.cfg.get("sites_file","")):
+            self.cfg["sites_file"] = auto_sites
+        # Only ask for username if not already set — paths no longer required.
         if not self.cfg.get("username"):
             self._run_wizard(first_run=True)
         else:
