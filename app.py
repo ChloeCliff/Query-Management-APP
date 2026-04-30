@@ -411,6 +411,20 @@ THEMES = {
         },
         "P_COLORS":{"High":("#F4A4A4","#321212"),"Medium":("#F4C56E","#312407"),"Low":("#86E0B6","#0D251A")},
     },
+    "Crimson Ember": {
+        "BG":"#170F12","CARD":"#221418","CARD2":"#2B1B21","NAV":"#120B0E","NAV2":"#1A1115",
+        "BORDER":"#45303A","ACCENT":"#E11D48","ACCENT2":"#FB7185",
+        "SUCCESS":"#34D399","WARNING":"#FBBF24","DANGER":"#F87171",
+        "MUTED":"#8E6B79","TEXT":"#F6E9EE","TEXT2":"#C7A5B2","PURPLE":"#C084FC",
+        "NAV_TEXT":"#FCECEF","NAV_MUTED":"#D3A7B5","PRIMARY_FG":"#2A0E17",
+        "S_COLORS":{
+            "Open":         ("#FB7185","#3A1623"),
+            "In Progress":  ("#FDE68A","#32240A"),
+            "Pending info": ("#C7A5B2","#2B1B21"),
+            "Resolved":     ("#6EE7B7","#0A2818"),
+        },
+        "P_COLORS":{"High":("#FCA5A5","#3A1218"),"Medium":("#FDE68A","#32240A"),"Low":("#6EE7B7","#0A2818")},
+    },
     "Mist Light": {
         "BG":"#EEF4F6","CARD":"#FFFFFF","CARD2":"#F7FBFC","NAV":"#DDE8EB","NAV2":"#E8F0F2",
         "BORDER":"#C9D8DD","ACCENT":"#23778C","ACCENT2":"#4CA4B5",
@@ -433,6 +447,7 @@ THEME_NOTES = {
     "Stone & Sage": ("Low-glare green-grey", "Quiet workspace styling for long sessions"),
     "Driftwood": ("Warm neutral without harsh amber", "A softer, service-desk look with warmer cards"),
     "Harbour Green": ("Company-inspired using #219F78", "Shows your brand colour without making the whole UI green"),
+    "Crimson Ember": ("Deep red accent with warm neutrals", "Useful when you want a stronger priority-focused visual style"),
     "Mist Light": ("Soft light theme with readable header", "Airier layout with much stronger toolbar contrast"),
 }
 ACTIVE_THEME = "Slate & Teal"
@@ -3678,8 +3693,6 @@ class QueryTrackerApp(tk.Tk):
                     except: pass
             bind_card()
 
-            bind_card()
-
         # SLA card — only show when there are queries with raised_date set
         if qs_with_raised:
             sla_col=SUCCESS if sla_pct>=80 else WARNING if sla_pct>=50 else DANGER
@@ -5544,7 +5557,9 @@ class QueryTrackerApp(tk.Tk):
                      font=(FONT,9),bg=NAV,fg=TEXT2).pack(anchor="w",pady=(4,0))
             tk.Frame(nd,bg=ACCENT,height=2).pack(fill="x")
 
-            inner,_=scrollable_frame(tk.Frame(nd,bg=BG)); inner_outer=nd
+            notif_host=tk.Frame(nd,bg=BG)
+            notif_host.pack(fill="both",expand=True)
+            inner,_=scrollable_frame(notif_host)
 
             for row_num,msg in unread:
                 # Parse message parts
