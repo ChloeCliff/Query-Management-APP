@@ -1820,37 +1820,10 @@ class SetupWizard(tk.Toplevel):
         gen=self._tab_frames["general"]
         body=tk.Frame(gen,bg=BG,padx=28,pady=20); body.pack(fill="both",expand=True)
 
-        def path_row(label,note,key,save_mode=False):
-            tk.Label(body,text=label,font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w",pady=(12,2))
-            tk.Label(body,text=note,font=(FONT,9),bg=BG,fg=TEXT2).pack(anchor="w")
-            row=tk.Frame(body,bg=BG); row.pack(fill="x",pady=(6,0))
-            var=tk.StringVar(value=self.cfg.get(key,""))
-            card=tk.Frame(row,bg=CARD2,highlightthickness=1,highlightbackground=BORDER)
-            card.pack(side="left",fill="x",expand=True,padx=(0,10))
-            tk.Entry(card,textvariable=var,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,
-                     relief="flat",bd=8,highlightthickness=0).pack(fill="x")
-            def browse(v=var,sm=save_mode):
-                current=v.get().strip()
-                initial_dir=os.path.dirname(current) if current and os.path.dirname(current) else DEFAULT_DATA_DIR
-                if sm:
-                    # Always use open-file picker — never overwrite
-                    p=filedialog.askopenfilename(
-                        title="Select your query_tracker.xlsx",
-                        initialdir=initial_dir,
-                        filetypes=[("Excel files","*.xlsx"),("All files","*.*")],
-                    )
-                else:
-                    p=filedialog.askopenfilename(
-                        title="Find sites.xlsx",
-                        initialdir=initial_dir,
-                        filetypes=[("Excel files","*.xlsx")],
-                    )
-                if p: v.set(p)
-            make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
-            return var
-
         # ── Auto-path info ────────────────────────────────────────────────────
         auto_excel, auto_sites = _auto_data_paths()
+        self.excel_var=tk.StringVar(value=auto_excel)
+        self.sites_var=tk.StringVar(value=auto_sites)
         auto_card=tk.Frame(body,bg="#0F1E38",highlightthickness=1,highlightbackground="#1D3A6E",padx=12,pady=10)
         auto_card.pack(fill="x",pady=(4,0))
         tk.Label(auto_card,
@@ -1863,58 +1836,10 @@ class SetupWizard(tk.Toplevel):
                        "inside the Data\\ folder next to the app and it will find them automatically."),
                  font=(FONT,8),bg="#0F1E38",fg="#BAE6FD",justify="left",wraplength=520).pack(anchor="w",pady=(4,0))
 
-        # Advanced override — collapsed by default so it does not confuse users
-        adv_visible=[False]
-        adv_toggle=tk.Label(body,text="▶  Advanced: override file paths manually",
-                            font=(FONT,8),bg=BG,fg=MUTED,cursor="hand2")
-        adv_toggle.pack(anchor="w",pady=(10,0))
-        adv_frame=tk.Frame(body,bg=BG)
-
-        def _toggle_adv(*_):
-            if adv_visible[0]:
-                adv_frame.pack_forget()
-                adv_toggle.configure(text="▶  Advanced: override file paths manually")
-            else:
-                adv_frame.pack(fill="x",pady=(4,0))
-                adv_toggle.configure(text="▼  Advanced: override file paths manually")
-            adv_visible[0]=not adv_visible[0]
-        adv_toggle.bind("<Button-1>",_toggle_adv)
-
-        def path_row(label,note,key,save_mode=False,parent=adv_frame):
-            tk.Label(parent,text=label,font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w",pady=(12,2))
-            tk.Label(parent,text=note,font=(FONT,9),bg=BG,fg=TEXT2).pack(anchor="w")
-            row=tk.Frame(parent,bg=BG); row.pack(fill="x",pady=(6,0))
-            var=tk.StringVar(value=self.cfg.get(key,""))
-            card=tk.Frame(row,bg=CARD2,highlightthickness=1,highlightbackground=BORDER)
-            card.pack(side="left",fill="x",expand=True,padx=(0,10))
-            tk.Entry(card,textvariable=var,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,
-                     relief="flat",bd=8,highlightthickness=0).pack(fill="x")
-            def browse(v=var,sm=save_mode):
-                current=v.get().strip()
-                initial_dir=os.path.dirname(current) if current and os.path.dirname(current) else DEFAULT_DATA_DIR
-                if sm:
-                    p=filedialog.askopenfilename(title="Select your query_tracker.xlsx",
-                        initialdir=initial_dir,filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
-                else:
-                    p=filedialog.askopenfilename(title="Find sites.xlsx",
-                        initialdir=initial_dir,filetypes=[("Excel files","*.xlsx")])
-                if p: v.set(p)
-            make_btn(row,"Browse",browse,"default",padx=14,pady=6).pack(side="left")
-            return var
-
-        if not self.cfg.get("excel_file"):
-            self.cfg["excel_file"] = auto_excel
-        if not self.cfg.get("sites_file"):
-            self.cfg["sites_file"] = auto_sites
-        self.excel_var=path_row("Query data file",
-            "Override the auto-detected tracker path (leave blank to use Data\\ folder).","excel_file",save_mode=True)
-        self.sites_var=path_row("Site list (sites.xlsx)",
-            "Override the auto-detected sites path (leave blank to use Data\\ folder).","sites_file")
-
         cfg_card=tk.Frame(body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=8)
         cfg_card.pack(fill="x",pady=(10,0))
         tk.Label(cfg_card,
-                 text=(f"Settings file: {CONFIG_FILE}"),
+                 text=(f"Settings file: {CONFIG_FILE}\n\nPaths are not stored in config. Linked trackers are transfer targets only."),
                  font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=520).pack(anchor="w")
 
         def test_sites():
@@ -2004,7 +1929,7 @@ class SetupWizard(tk.Toplevel):
         lb_sb.pack(side="right",fill="y"); lb.pack(fill="both",expand=True,padx=4,pady=4)
 
         # Seed from the shared tracker if available, otherwise local config
-        _shared_qt=load_shared_settings(self.cfg.get("excel_file",""))
+        _shared_qt=load_shared_settings(auto_excel)
         current_types=list(_shared_qt.get("query_types") or self.cfg.get("query_types",DEFAULT_QUERY_TYPES))
         def refresh_lb():
             lb.delete(0,"end")
@@ -2067,7 +1992,7 @@ class SetupWizard(tk.Toplevel):
         tm_lb.configure(yscrollcommand=tm_sb.set)
         tm_sb.pack(side="right",fill="y"); tm_lb.pack(fill="both",expand=True,padx=4,pady=4)
 
-        _shared_tm=load_shared_settings(self.cfg.get("excel_file",""))
+        _shared_tm=load_shared_settings(auto_excel)
         current_members=list(_shared_tm.get("team_members") or self.cfg.get("team_members",[]))
         def refresh_tm_lb():
             tm_lb.delete(0,"end")
@@ -2442,9 +2367,9 @@ class SetupWizard(tk.Toplevel):
 
     def _save(self, close_after=True):
         auto_excel, auto_sites = _auto_data_paths()
-        excel=(self.excel_var.get().strip() or auto_excel); name=self.name_var.get().strip()
+        excel=auto_excel; name=self.name_var.get().strip()
         if not excel:
-            messagebox.showwarning("Required","Please choose a location for the query data file.",parent=self); return
+            messagebox.showwarning("Required","Cannot find Data\\query_tracker.xlsx next to the app.",parent=self); return
         if not name:
             messagebox.showwarning("Required","Please enter your name.",parent=self); return
         try:
@@ -6005,7 +5930,7 @@ class QueryTrackerApp(tk.Tk):
     def _open_settings(self):
         def on_complete(cfg):
             self.cfg=cfg; self.username=cfg.get("username","Unknown")
-            self.excel_file=cfg.get("excel_file",""); self.sites_file=cfg.get("sites_file","")
+            self.excel_file,self.sites_file=_auto_data_paths()
             shared=load_shared_settings(self.excel_file)
             raw=shared.get("team_members") or cfg.get("team_members",[])
             self.team_members=raw if raw else [self.username]
