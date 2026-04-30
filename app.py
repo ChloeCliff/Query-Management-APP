@@ -1887,8 +1887,8 @@ class SetupWizard(tk.Toplevel):
         tk.Label(note_f,
                  text="ℹ  Multi-user setup: each person runs their own copy of this app on their PC.\n"
                       "   Settings (including your name) are saved locally on your PC only — not in the shared folder.\n"
-                      "   The query data file (query_tracker.xlsx) lives in the shared OneDrive folder and is shared by everyone.\n"
-                      "   Each person just needs to point their app at the same shared xlsx in Settings → General.",
+                      "   The query data file (query_tracker.xlsx) lives in the app's Data folder and is shared by everyone using that copy.\n"
+                      "   The app now finds Data\\query_tracker.xlsx and Data\\sites.xlsx automatically — no path setup needed.",
                  font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=520).pack(anchor="w")
         self.name_var=tk.StringVar(value=self.cfg.get("username",""))
         nc=tk.Frame(body,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); nc.pack(anchor="w",pady=(6,0))
@@ -2109,6 +2109,8 @@ class SetupWizard(tk.Toplevel):
         tk.Label(lt_body,text="Linked trackers",font=(FONT,10,"bold"),bg=BG,fg=TEXT).pack(anchor="w")
         tk.Label(lt_body,text="Add other teams' query tracker Excel files here.\nYou can then transfer queries directly to them using the ↗ Transfer button.",
                  font=(FONT,9),bg=BG,fg=TEXT2,wraplength=540,justify="left").pack(anchor="w",pady=(4,12))
+        tk.Label(lt_body,text="Linked trackers are transfer targets only. They do not change this app's active tracker or site list.",
+             font=(FONT,8),bg=BG,fg=MUTED,wraplength=540,justify="left").pack(anchor="w",pady=(0,8))
 
         current_trackers=list(self.cfg.get("linked_trackers",[]))  # [{name, excel_file}]
 
