@@ -7471,31 +7471,6 @@ class QueryTrackerApp(tk.Tk):
         fund_hint_lbl=tk.Label(form,text="",font=(FONT,8),bg=BG,fg=WARNING,anchor="w",justify="left",wraplength=560)
         fund_hint_lbl.pack(fill="x",pady=(0,2))
 
-        # ── DEBUG INFO PANEL ────────────────────────────────────────────────
-        debug_lbl=tk.Label(form,text="",font=(FONT,7),bg=BG,fg=MUTED,anchor="nw",justify="left",wraplength=560)
-        debug_lbl.pack(fill="x",pady=(0,4))
-
-        def _update_debug(*_):
-            """Update debug panel with current state."""
-            c=client_var.get().strip()
-            f=fund_var.get().strip()
-            s=site_var.get().strip()
-            sf=getattr(self,"sites_file","") or "(not set)"
-            lines=[f"[DEBUG] Sites file: {sf}"]
-            if c:
-                lines.append(f"Client: {c}")
-                cb_funds=self._column_b_funds_for_client(c)
-                lines.append(f"  Funds from Column B: {cb_funds}")
-                if f:
-                    lines.append(f"Fund: {f}")
-                    cb_sites=self._column_b_sites_for_client_fund(c,f)
-                    lines.append(f"  Sites for {c}+{f}: {cb_sites}")
-                    if s:
-                        lines.append(f"Site: {s}")
-                        cb_fund=self._column_b_fund_for_client_site(c,s)
-                        lines.append(f"  Fund for {c}+{s}: {cb_fund}")
-            debug_lbl.config(text="\n".join(lines))
-
         def _set_fund_hint(values):
             if values:
                 fund_hint_lbl.config(text="")
@@ -7714,7 +7689,6 @@ class QueryTrackerApp(tk.Tk):
                 # New client — allow free typing everywhere
                 site_cb.configure(values=[])
                 fund_cb.configure(values=self._fund_filter_values("All"),state="normal")
-                _update_debug()
                 return
             # Populate site list immediately — this is what was missing
             sites=self.sites_by_client.get(c,[])
@@ -7738,7 +7712,6 @@ class QueryTrackerApp(tk.Tk):
             fund_cb.configure(values=funds,state="normal")
             _set_fund_hint(funds)
             if len(funds)==1: fund_var.set(funds[0])
-            _update_debug()
 
         def _refresh_add_fund_values(*_):
             c=client_var.get().strip()
@@ -7756,7 +7729,6 @@ class QueryTrackerApp(tk.Tk):
                 funds=self._column_b_fund_values()
             fund_cb.configure(values=funds,state="normal")
             _set_fund_hint(funds)
-            _update_debug()
 
         def on_fund(*_):
             c=client_var.get(); f=fund_var.get()
@@ -7781,7 +7753,6 @@ class QueryTrackerApp(tk.Tk):
                           prop_var,address1_var,town_var,postcode_var,spid_var,serial_var,contact_var]:
                     v.set("")
                 utility_cb.configure(values=[])
-            _update_debug()
 
         def on_site(*_):
             c=client_var.get(); s=site_var.get(); key=(c,s)
@@ -7858,7 +7829,6 @@ class QueryTrackerApp(tk.Tk):
             else:
                 related_site_lbl.config(text="")
             if nm_btn is not None: nm_btn.pack(side="left")
-            _update_debug()
 
         def on_utility(*_):
             c=client_var.get(); s=site_var.get(); u=utility_var.get(); key=(c,s)
@@ -7926,9 +7896,6 @@ class QueryTrackerApp(tk.Tk):
             on_client()   # populates site list
             on_site()     # populates utility list and fills fund
             if copy_from.get("utility"): utility_var.set(copy_from["utility"]); on_utility()
-        
-        # Initial debug panel update
-        _update_debug()
 
         def add_new_meter():
             c=client_var.get(); s=site_var.get()
