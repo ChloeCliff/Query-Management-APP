@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import os, json, shutil, subprocess, sys, tempfile, threading, re
+import os, json, shutil, subprocess, sys, tempfile, threading, re, time, socket, collections
 import hashlib
 from datetime import date, datetime, timedelta
 import openpyxl
@@ -223,6 +223,37 @@ def _setup_dnd(toplevel, callback):
 
 # Directory the exe (or script) lives in — used for user data/config paths.
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+
+# ── Machine identity (used for change queue ordering) ─────────────────────────
+MACHINE_NAME = socket.gethostname()
+
+# ── Change record structure for the save queue ────────────────────────────────
+# Each user action that modifies data becomes a ChangeRecord before it is
+# written to Excel. The queue guarantees FIFO processing per machine and
+# records enough context to apply a targeted (query-level) merge rather than
+# rewriting the entire workbook from scratch.
+#
+# Queue ordering across machines is enforced by the .qblock advisory lock:
+# whichever machine acquires the lock first writes first.  Within a single
+# machine, records are appended in the order the user pressed Save, so FIFO
+# is preserved automatically.
+#
+# change_type values:
+#   "query_add"     – a brand-new query was logged
+#   "query_edit"    – an existing query was modified (status, note, dates …)
+#   "query_delete"  – a query was deleted
+#   "attachment"    – an attachment log entry was added to a query
+#   "query_update"  – bulk/automatic update (escalation, batch action-date …)
+#   "settings"      – team members, query types, or other shared settings changed
+ChangeRecord = collections.namedtuple(
+    "ChangeRecord",
+    ["queued_at",       # float – time.time() when the user pressed Save
+     "machine",         # str   – MACHINE_NAME for auditing / tiebreaking
+     "change_type",     # str   – see above
+     "query_id",        # str   – primary query ID affected ("" for bulk/settings)
+     "description",     # str   – human-readable label shown in Sync Health
+     "data_snapshot"],  # dict|None – copy of the query dict at queue time
+)
 # Directory bundled resources are loaded from when packaged with PyInstaller.
 RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
@@ -258,12 +289,153 @@ DEFAULT_SITES_FILE  = os.path.join(DEFAULT_DATA_DIR, "sites.xlsx")
 DEFAULT_BACKUP_DIR  = os.path.join(DEFAULT_DATA_DIR, "Backups")
 DEFAULT_ATTACH_DIR  = os.path.join(APP_DIR, "ATTACHMENTS")
 
+def _raw_config_path_overrides():
+    """Read legacy/manual excel/sites path overrides from config files.
+
+    This keeps older deployments working where tracker files live outside
+    the app folder (for example in shared synced folders).
+    """
+    for path in (CONFIG_FILE, OLD_LOCAL_CONFIG_FILE, SHARED_CONFIG_FILE, LEGACY_CONFIG_FILE):
+        try:
+            if not path or not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                cfg=json.load(f)
+            excel=str(cfg.get("excel_file", "") or "").strip()
+            sites=str(cfg.get("sites_file", "") or "").strip()
+            if excel or sites:
+                return excel, sites
+        except Exception:
+            continue
+    return "", ""
+
+def _discover_workbook_path(base_dir, role):
+    """Best-effort workbook discovery when exact default filenames are absent.
+
+    role='tracker' expects a workbook containing a Queries sheet.
+    role='sites'   expects a workbook containing a Sites/Site sheet.
+    """
+    if not base_dir or not os.path.isdir(base_dir):
+        return ""
+
+    try:
+        names=[n for n in os.listdir(base_dir) if n.lower().endswith(".xlsx") and not n.startswith("~$")]
+    except Exception:
+        return ""
+
+    if not names:
+        return ""
+
+    def _is_template_like(name):
+        s=(name or "").lower()
+        return any(tok in s for tok in ("template", "sample", "example", "demo", "pass_fail", "pass-fail", "test"))
+
+    def _looks_valid_for_role(path):
+        try:
+            wb=openpyxl.load_workbook(path, read_only=True, data_only=True)
+            sheetnames=[str(s or "").strip().lower() for s in wb.sheetnames]
+            if role=="tracker":
+                if "queries" not in sheetnames:
+                    return False
+                ws=wb[wb.sheetnames[sheetnames.index("queries")]]
+                # Prefer files that have at least one data row below header.
+                for row in ws.iter_rows(min_row=2, max_row=200, values_only=True):
+                    if any(str(c or "").strip() for c in row):
+                        return True
+                return False
+
+            # sites role
+            ws=None
+            for wanted in ("sites", "site"):
+                if wanted in sheetnames:
+                    ws=wb[wb.sheetnames[sheetnames.index(wanted)]]
+                    break
+            if ws is None:
+                ws=wb.active
+
+            # Must look like actual site data: at least one row where col A and D have values.
+            for row in ws.iter_rows(min_row=1, max_row=240, values_only=True):
+                a=str((row[0] if len(row)>0 else "") or "").strip()
+                d=str((row[3] if len(row)>3 else "") or "").strip()
+                if a and d and a.lower()!="client" and d.lower() not in ("site", "site name"):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    role_terms=("query","tracker") if role=="tracker" else ("site","sites")
+    ordered=sorted(
+        names,
+        key=lambda n: (
+            -sum(1 for t in role_terms if t in n.lower()),
+            _is_template_like(n),
+            len(n),
+            n.lower(),
+        ),
+    )
+
+    # Validate candidates by workbook content; this avoids picking templates.
+    for name in ordered:
+        path=os.path.join(base_dir, name)
+        if _looks_valid_for_role(path):
+            return path
+
+    return ""
+
 def _auto_data_paths():
     """Return (excel_file, sites_file) resolved from Data/ next to the app.
-    Always prefer the real files when they exist so no manual path setup is
-    needed — the app just works wherever it is placed."""
+    Prefer Data/ by default, but keep backward compatibility with older
+    deployments where files were stored next to the app executable/script."""
+
+    # 1) Explicit environment overrides (highest priority).
+    env_excel=(os.environ.get("QBOX_EXCEL_FILE") or "").strip()
+    env_sites=(os.environ.get("QBOX_SITES_FILE") or "").strip()
+
+    # 2) Legacy/manual config overrides if they still point to valid files.
+    cfg_excel, cfg_sites = _raw_config_path_overrides()
+
     excel = DEFAULT_EXCEL_FILE
     sites = DEFAULT_SITES_FILE
+
+    # Apply explicit overrides per-file (not all-or-nothing).
+    if env_excel and os.path.exists(env_excel):
+        excel=env_excel
+    elif cfg_excel and os.path.exists(cfg_excel):
+        excel=cfg_excel
+
+    if env_sites and os.path.exists(env_sites):
+        sites=env_sites
+    elif cfg_sites and os.path.exists(cfg_sites):
+        sites=cfg_sites
+
+    if not os.path.exists(excel):
+        discovered=_discover_workbook_path(DEFAULT_DATA_DIR, "tracker")
+        if discovered:
+            excel=discovered
+    if not os.path.exists(sites):
+        discovered=_discover_workbook_path(DEFAULT_DATA_DIR, "sites")
+        if discovered:
+            sites=discovered
+
+    # Backward compatibility: if Data/ files do not exist but legacy files do,
+    # use legacy paths so upgrades do not silently load empty datasets.
+    legacy_excel = os.path.join(APP_DIR, "query_tracker.xlsx")
+    legacy_sites = os.path.join(APP_DIR, "sites.xlsx")
+
+    if not os.path.exists(excel) and os.path.exists(legacy_excel):
+        excel = legacy_excel
+    elif not os.path.exists(excel):
+        discovered=_discover_workbook_path(APP_DIR, "tracker")
+        if discovered:
+            excel=discovered
+
+    if not os.path.exists(sites) and os.path.exists(legacy_sites):
+        sites = legacy_sites
+    elif not os.path.exists(sites):
+        discovered=_discover_workbook_path(APP_DIR, "sites")
+        if discovered:
+            sites=discovered
+
     return excel, sites
 
 def _ensure_app_folders():
@@ -275,13 +447,10 @@ def _ensure_config_folder():
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
 def _cleanup_old_local_config():
-    # Legacy local config next to the app can cause sync/merge conflicts in
-    # shared folders. We no longer use this location.
-    try:
-        if os.path.exists(OLD_LOCAL_CONFIG_FILE):
-            os.remove(OLD_LOCAL_CONFIG_FILE)
-    except Exception:
-        pass
+    # Backward compatibility: do not delete legacy local config.
+    # Older working builds stored excel/sites paths in this file, and removing
+    # it can force the app onto a different sites workbook (breaking fund links).
+    return
 
 def resource_path(*parts):
     return os.path.join(RESOURCE_DIR, *parts)
@@ -298,8 +467,8 @@ DEFAULT_QUERY_TYPES = [
 STATUSES   = ["Open","In Progress","Pending info","Resolved"]
 PRIORITIES = ["High","Medium","Low"]
 UTILITY_OPTIONS = ["Electricity","Gas","Water","Heat Network","Cooling","Other"]
-COLS = ["ID","Reference","Client","Fund","Site","Utility Type","Specific Meter","Type","Status",
-        "Priority","Description","Opened","Action Date","Resolved Date","Activity Log",
+COLS = ["ID","Reference","Client","Fund","Site","Utility Type","Specific Meter","Type","Query Overview","Status",
+    "Priority","Description","Opened","Action Date","Resolved Date","Activity Log",
         "Site Address 1","Town","Postcode","Supply Point ID","Meter Serial","Managing Agent Contact","Property Code",
         "Last Updated By","Last Updated Date","Assigned To","Query Raised Date"]
 
@@ -506,18 +675,22 @@ def load_config():
         try:
             with open(CONFIG_FILE) as f:
                 cfg=json.load(f)
-            # Paths are always auto-resolved from Data/ and are not persisted.
-            cfg.pop("excel_file", None)
-            cfg.pop("sites_file", None)
             return cfg
         except: pass
+    # Backward compatibility: older versions stored local settings here.
+    if os.path.exists(OLD_LOCAL_CONFIG_FILE):
+        try:
+            with open(OLD_LOCAL_CONFIG_FILE) as f:
+                cfg=json.load(f)
+            save_config(cfg)
+            return cfg
+        except:
+            pass
     # One-time fallback from the old shared local config path.
     if CONFIG_FILE != SHARED_CONFIG_FILE and os.path.exists(SHARED_CONFIG_FILE):
         try:
             with open(SHARED_CONFIG_FILE) as f:
                 cfg=json.load(f)
-            cfg.pop("excel_file", None)
-            cfg.pop("sites_file", None)
             save_config(cfg)
             return cfg
         except:
@@ -526,8 +699,6 @@ def load_config():
         try:
             with open(LEGACY_CONFIG_FILE) as f:
                 cfg=json.load(f)
-            cfg.pop("excel_file", None)
-            cfg.pop("sites_file", None)
             save_config(cfg)
             return cfg
         except:
@@ -996,9 +1167,11 @@ def load_site_data(sites_file):
         s = re.sub(r"\s+", " ", s)
         return s
 
+    def norm_text(v):
+        return re.sub(r"\s+", " ", str(v or "").strip()).casefold()
+
     aliases = {
         "client": {"client"},
-        "fund": {"fund"},
         "prop_code": {"property code", "prop code", "property", "prop"},
         "site": {"site", "site name"},
         "address1": {"address 1", "address", "site address", "address line 1"},
@@ -1013,7 +1186,7 @@ def load_site_data(sites_file):
     header_map = None
     header_row = None
     best_score = -1
-    for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True), start=1):
+    for r_i, row in enumerate(ws.iter_rows(min_row=1, max_row=80, values_only=True), start=1):
         local = {}
         for idx, cell in enumerate(row):
             nh = norm_header(cell)
@@ -1032,7 +1205,7 @@ def load_site_data(sites_file):
         data_start_row = (header_row or 1) + 1
     else:
         data_start_row = 1
-        for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
+        for row in ws.iter_rows(min_row=1, max_row=80, values_only=True):
             col_a = row[0] if row else None
             col_d = row[3] if len(row) > 3 else None
             if looks_like_header(col_a):
@@ -1043,13 +1216,19 @@ def load_site_data(sites_file):
                 continue
             break
 
+    # Some site lists use merged cells and only provide client/fund once,
+    # then leave following rows blank. Carry context forward safely.
+    last_client = ""
+    last_fund_for_client = {}
+
     for row in ws.iter_rows(min_row=data_start_row, values_only=True):
         n=len(row)
         def gv(i): return str(row[i] or "").strip() if (i is not None and i<n) else ""
 
         if header_map:
             client=gv(header_map.get("client"))
-            fund=gv(header_map.get("fund"))
+            # Fund source is fixed to column B only.
+            fund=gv(1)
             prop_code=gv(header_map.get("prop_code"))
             site_name=gv(header_map.get("site"))
             address1=gv(header_map.get("address1"))
@@ -1060,19 +1239,40 @@ def load_site_data(sites_file):
             serial=gv(header_map.get("serial"))
             contact=gv(header_map.get("contact"))
         else:
-            if not row or not row[0]:
+            if not row:
                 continue
             col_a = str(row[0]).strip()
-            if looks_like_header(col_a):
+            if col_a and looks_like_header(col_a):
                 continue
             client=col_a
             fund=gv(1); prop_code=gv(2); site_name=gv(3)
             address1=gv(4); town=gv(5); postcode=gv(6); utility=gv(7); spid=gv(8); serial=gv(9); contact=gv(10)
 
+        if client:
+            last_client = client
+        else:
+            client = last_client
+
+        if fund:
+            last_fund_for_client[client] = fund
+        else:
+            fund = last_fund_for_client.get(client, "")
+
         if not client or not site_name:
             continue
         if looks_like_header(client) or looks_like_header(site_name):
             continue
+
+        # Guard against malformed rows where a site value spills into client.
+        # If the current client already exists as a site under the previous
+        # client context, keep the previous client instead of creating a fake
+        # top-level client entry.
+        if last_client and client and client != last_client:
+            client_norm = norm_text(client)
+            last_sites = sites_by_client.get(last_client, [])
+            if any(norm_text(site_item) == client_norm for site_item in last_sites):
+                client = last_client
+
         if client not in clients: clients.append(client)
         sites_by_client.setdefault(client,[])
         if site_name not in sites_by_client[client]: sites_by_client[client].append(site_name)
@@ -1102,27 +1302,35 @@ def load_queries(excel_file):
         if not row[0]: continue
         n=len(row)
         def g(i,d=""): return str(row[i] or d) if i<n else d
-        if n>=22:
+        if n>=27:
             q={"id":g(0),"ref":g(1),"client":g(2),"fund":g(3),"site":g(4),"utility":g(5),
-               "meter":g(6),"type":g(7),"status":g(8,"Open"),"priority":g(9,"Medium"),
-             "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
-             "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
+               "meter":g(6),"type":g(7),"query_overview":g(8),"status":g(9,"Open"),"priority":g(10,"Medium"),
+               "desc":g(11),"opened":_to_iso_date_str(g(12)) or today_str(),
+               "chase_date":_to_iso_date_str(g(13)),"resolved_date":_to_iso_date_str(g(14)),
+               "log":g(15),"address1":g(16),"town":g(17),"postcode":g(18),"spid":g(19),"serial":g(20),"contact":g(21),
+               "prop_code":g(22),"last_by":g(23),"last_date":_to_iso_date_str(g(24)),"assigned_to":g(25),
+               "raised_date":_to_iso_date_str(g(26))}
+        elif n>=22:
+            q={"id":g(0),"ref":g(1),"client":g(2),"fund":g(3),"site":g(4),"utility":g(5),
+               "meter":g(6),"type":g(7),"query_overview":"","status":g(8,"Open"),"priority":g(9,"Medium"),
+               "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
+               "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
                "log":g(14),"address1":g(15),"town":g(16),"postcode":g(17),"spid":g(18),"serial":g(19),"contact":g(20),
-             "prop_code":g(21),"last_by":g(22),"last_date":_to_iso_date_str(g(23)),"assigned_to":g(24),
-             "raised_date":_to_iso_date_str(g(25))}
+               "prop_code":g(21),"last_by":g(22),"last_date":_to_iso_date_str(g(23)),"assigned_to":g(24),
+               "raised_date":_to_iso_date_str(g(25))}
         elif n>=20:
             q={"id":g(0),"ref":g(1),"client":g(2),"fund":g(3),"site":g(4),"utility":g(5),
-               "meter":g(6),"type":g(7),"status":g(8,"Open"),"priority":g(9,"Medium"),
-             "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
-             "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
+               "meter":g(6),"type":g(7),"query_overview":"","status":g(8,"Open"),"priority":g(9,"Medium"),
+               "desc":g(10),"opened":_to_iso_date_str(g(11)) or today_str(),
+               "chase_date":_to_iso_date_str(g(12)),"resolved_date":_to_iso_date_str(g(13)),
                "log":g(14),"address1":g(15),"town":"","postcode":"","spid":g(16),"serial":g(17),"contact":g(18),
-             "prop_code":g(19),"last_by":g(20),"last_date":_to_iso_date_str(g(21)),"assigned_to":g(22),
-             "raised_date":_to_iso_date_str(g(23))}
+               "prop_code":g(19),"last_by":g(20),"last_date":_to_iso_date_str(g(21)),"assigned_to":g(22),
+               "raised_date":_to_iso_date_str(g(23))}
         else:
             q={"id":g(0),"ref":g(1),"client":g(2),"fund":"","site":g(3),"utility":g(4),
-               "meter":g(5),"type":g(6),"status":g(7,"Open"),"priority":g(8,"Medium"),
-             "desc":g(9),"opened":_to_iso_date_str(g(10)) or today_str(),
-             "chase_date":_to_iso_date_str(g(11)),"resolved_date":_to_iso_date_str(g(12)),
+               "meter":g(5),"type":g(6),"query_overview":"","status":g(7,"Open"),"priority":g(8,"Medium"),
+               "desc":g(9),"opened":_to_iso_date_str(g(10)) or today_str(),
+               "chase_date":_to_iso_date_str(g(11)),"resolved_date":_to_iso_date_str(g(12)),
                "log":g(13),"address1":g(14),"town":"","postcode":"","spid":g(15),"serial":g(16),"contact":g(17),
                "prop_code":g(18),"last_by":"","last_date":"","assigned_to":"","raised_date":""}
         queries.append(q)
@@ -1168,6 +1376,109 @@ def _merge_queries_for_save(local_queries, excel_file):
             merged.append(remote_by_id[qid])
     return merged
 
+
+def _apply_change_to_disk(record, excel_file, fallback_queries):
+    """Build the merged query list to write for a single ChangeRecord.
+
+    Rather than replacing the entire on-disk dataset with the in-memory copy,
+    this function applies only the change described by *record* to the current
+    on-disk state.  This means Person A's edit to query 100 never overwrites
+    Person B's concurrent edit to query 200, even if they pressed Save within
+    the same second.
+
+    Conflict resolution order (highest to lowest priority):
+      1. The specific query data carried by the ChangeRecord is authoritative
+         for that query.
+      2. All other queries are taken from the on-disk state (preserving other
+         users' concurrent edits).
+      3. Log entries are union-merged so no log line is lost.
+
+    For bulk / settings changes the function falls back to the standard full
+    _merge_queries_for_save behaviour.
+    """
+    disk_queries = load_queries(excel_file) if excel_file and os.path.exists(excel_file) else []
+    disk_by_id   = {str(q.get("id", "")): q for q in disk_queries if q.get("id")}
+    qid          = str(record.query_id)
+    ct           = record.change_type
+    snap         = record.data_snapshot  # may be None for bulk changes
+
+    # ── query_delete: remove the query from disk ───────────────────────────
+    if ct == "query_delete":
+        return [q for q in disk_queries if str(q.get("id", "")) != qid]
+
+    # ── query_add: insert if not already present ───────────────────────────
+    if ct == "query_add":
+        if qid and qid not in disk_by_id and snap:
+            return [snap] + disk_queries   # newest first
+        return disk_queries
+
+    # ── query_edit / attachment: targeted replace for one query ───────────
+    if ct in ("query_edit", "attachment") and qid and snap:
+        disk_q = disk_by_id.get(qid)
+        if disk_q:
+            # Merge log lines so neither machine's notes are lost
+            l_entries = [e.strip() for e in (snap.get("log", "") or "").split(" | ") if e.strip()]
+            r_entries = [e.strip() for e in (disk_q.get("log","") or "").split(" | ") if e.strip()]
+            combined  = []
+            for ent in r_entries + l_entries:
+                if ent not in combined:
+                    combined.append(ent)
+            merged_snap = dict(snap)
+            merged_snap["log"] = " | ".join(combined) if combined else snap.get("log", "")
+        else:
+            merged_snap = snap
+
+        result  = []
+        placed  = False
+        for q in disk_queries:
+            if str(q.get("id", "")) == qid:
+                result.append(merged_snap)
+                placed = True
+            else:
+                result.append(q)
+        if not placed:
+            result.insert(0, merged_snap)
+        return result
+
+    # ── bulk / settings / query_update: standard full merge ───────────────
+    # Uses fallback_queries (the caller's full in-memory list) against disk.
+    return _full_merge_preloaded(fallback_queries, disk_queries)
+
+
+def _full_merge_preloaded(local_queries, disk_queries):
+    """Same as _merge_queries_for_save but uses a pre-loaded disk list."""
+    disk_by_id  = {str(q.get("id","")): q for q in disk_queries if q.get("id")}
+    local_by_id = {str(q.get("id","")): q for q in local_queries if q.get("id")}
+    merged_ids  = []
+    for q in disk_queries:
+        qid = str(q.get("id",""))
+        if qid and qid not in merged_ids:
+            merged_ids.append(qid)
+    for q in local_queries:
+        qid = str(q.get("id",""))
+        if qid and qid not in merged_ids:
+            merged_ids.append(qid)
+    merged = []
+    for qid in merged_ids:
+        if qid in local_by_id and qid in disk_by_id:
+            lq = dict(local_by_id[qid])
+            rq = disk_by_id[qid]
+            l_e=[p.strip() for p in (lq.get("log","") or "").split(" | ") if p.strip()]
+            r_e=[p.strip() for p in (rq.get("log","") or "").split(" | ") if p.strip()]
+            combined=[]
+            for ent in r_e + l_e:
+                if ent not in combined:
+                    combined.append(ent)
+            if combined:
+                lq["log"]=" | ".join(combined)
+            merged.append(lq)
+        elif qid in local_by_id:
+            merged.append(local_by_id[qid])
+        elif qid in disk_by_id:
+            merged.append(disk_by_id[qid])
+    return merged
+
+
 def _acquire_excel_lock(excel_file, timeout=20.0, stale_seconds=180.0):
     lock_path=f"{excel_file}.qblock"
     deadline=datetime.now().timestamp()+timeout
@@ -1204,13 +1515,20 @@ def _release_excel_lock(fd, lock_path):
     except Exception:
         pass
 
-def save_all_queries(queries,excel_file):
+def save_all_queries(queries, excel_file, _pre_merged=False):
+    """Write *queries* to *excel_file*.
+
+    If *_pre_merged* is True the list has already been reconciled with the
+    on-disk state (by `_apply_change_to_disk`) so the internal merge step is
+    skipped.  Pass False (default) for direct / legacy callers.
+    """
     if not excel_file: return
     lock_fd, lock_path = _acquire_excel_lock(excel_file, timeout=22.0)
     if lock_fd is None:
         raise PermissionError("Tracker is locked by another app instance")
     try:
-        queries = _merge_queries_for_save(queries, excel_file)
+        if not _pre_merged:
+            queries = _merge_queries_for_save(queries, excel_file)
         if os.path.exists(excel_file):
             try:
                 wb=openpyxl.load_workbook(excel_file)
@@ -1233,7 +1551,7 @@ def save_all_queries(queries,excel_file):
         ws=wb.create_sheet("Queries",0)
         thin=Side(style="thin",color="CCCCCC"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
         hfil=PatternFill("solid",fgColor="0F1B2D"); hfnt=Font(bold=True,color="FFFFFF",name=FONT,size=10)
-        widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,28,16,14,20,20,28,14,18,14,18,12]
+        widths=[10,12,22,22,24,18,22,18,22,14,10,44,12,12,14,50,28,16,14,20,20,28,14,18,14,18,12]
         for i,(col,w) in enumerate(zip(COLS,widths),1):
             c=ws.cell(row=1,column=i,value=col)
             c.font=hfnt; c.fill=hfil; c.alignment=Alignment(horizontal="center",vertical="center"); c.border=bdr
@@ -1243,7 +1561,7 @@ def save_all_queries(queries,excel_file):
         pfills={"High":"FEE2E2","Medium":"FEF9C3","Low":"F0FDF4"}
         for r,q in enumerate(queries,2):
             vals=[q["id"],q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
-                  q["type"],q["status"],q["priority"],q["desc"],q["opened"],
+                  q["type"],q.get("query_overview",""),q["status"],q["priority"],q["desc"],q["opened"],
                   q.get("chase_date",""),q.get("resolved_date",""),q["log"],
                   q.get("address1",""),q.get("town",""),q.get("postcode",""),
                   q["spid"],q["serial"],q["contact"],q["prop_code"],
@@ -1252,9 +1570,9 @@ def save_all_queries(queries,excel_file):
             for c,v in enumerate(vals,1):
                 cell=ws.cell(row=r,column=c,value=v)
                 cell.font=Font(name=FONT,size=10)
-                cell.alignment=Alignment(vertical="top",wrap_text=(c in (11,15))); cell.border=bdr
-            ws.cell(row=r,column=9).fill=PatternFill("solid",fgColor=sfills.get(q["status"],"FFFFFF"))
-            ws.cell(row=r,column=10).fill=PatternFill("solid",fgColor=pfills.get(q["priority"],"FFFFFF"))
+                cell.alignment=Alignment(vertical="top",wrap_text=(c in (12,16))); cell.border=bdr
+            ws.cell(row=r,column=10).fill=PatternFill("solid",fgColor=sfills.get(q["status"],"FFFFFF"))
+            ws.cell(row=r,column=11).fill=PatternFill("solid",fgColor=pfills.get(q["priority"],"FFFFFF"))
         ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:{get_column_letter(len(COLS))}1"
         ds=wb.create_sheet("Dashboard",1); ds.sheet_view.showGridLines=False
         ds["A1"]="Query Tracker — Dashboard"
@@ -1848,8 +2166,8 @@ class SetupWizard(tk.Toplevel):
         tk.Label(auto_card,
                  text=(f"Query tracker:  {auto_excel}\n"
                        f"Site list:          {auto_sites}\n\n"
-                       "No path setup needed. Just place query_tracker.xlsx and sites.xlsx\n"
-                       "inside the Data\\ folder next to the app and it will find them automatically."),
+                     "No path setup needed. The app prefers query_tracker.xlsx and sites.xlsx\n"
+                     "in the Data\\ folder, and can also auto-detect likely workbook names."),
                  font=(FONT,8),bg="#0F1E38",fg="#BAE6FD",justify="left",wraplength=520).pack(anchor="w",pady=(4,0))
 
         cfg_card=tk.Frame(body,bg="#1A2E18",highlightthickness=1,highlightbackground="#2E5030",padx=10,pady=8)
@@ -1860,11 +2178,14 @@ class SetupWizard(tk.Toplevel):
 
         def test_sites():
             """Load the sites file right now and show what was found — for diagnosing issues."""
-            sf=self.sites_var.get().strip() or auto_sites
+            sf=(self.sites_var.get().strip() or "")
             if not sf:
-                messagebox.showwarning("No file set","No sites.xlsx found in the Data\\ folder and no override set.",parent=self); return
+                _e,_s=_auto_data_paths()
+                sf=_s
+            if not sf:
+                messagebox.showwarning("No file set","No site workbook found in Data\\ or next to the app.",parent=self); return
             if not os.path.exists(sf):
-                messagebox.showerror("File not found",f"Cannot find:\n{sf}\n\nPlace sites.xlsx in the Data\\ folder next to the app.",parent=self); return
+                messagebox.showerror("File not found",f"Cannot find:\n{sf}\n\nPlace your site workbook in the Data\\ folder next to the app.",parent=self); return
             try:
                 import openpyxl as _opx
                 wb=_opx.load_workbook(sf,data_only=True)
@@ -1876,7 +2197,8 @@ class SetupWizard(tk.Toplevel):
                     rows_preview.append(f"Row {i+1}: {[str(c or '')[:20] for c in row[:6]]}")
                 clients_found,sites_dict,*_=load_site_data(sf)
                 total_sites=sum(len(v) for v in sites_dict.values())
-                msg=(f"Sheets in file: {sheet_names}\n"
+                msg=(f"Resolved site workbook: {sf}\n\n"
+                     f"Sheets in file: {sheet_names}\n"
                      f"Active sheet: '{ws.title}'\n\n"
                      f"First rows (cols A–F):\n" + "\n".join(rows_preview) +
                      f"\n\nResult: {len(clients_found)} clients, {total_sites} sites loaded\n\n")
@@ -1903,8 +2225,8 @@ class SetupWizard(tk.Toplevel):
         tk.Label(note_f,
                  text="ℹ  Multi-user setup: each person runs their own copy of this app on their PC.\n"
                       "   Settings (including your name) are saved locally on your PC only — not in the shared folder.\n"
-                      "   The query data file (query_tracker.xlsx) lives in the app's Data folder and is shared by everyone using that copy.\n"
-                      "   The app now finds Data\\query_tracker.xlsx and Data\\sites.xlsx automatically — no path setup needed.",
+                      "   The query data file lives in the app's Data folder and is shared by everyone using that copy.\n"
+                      "   The app auto-detects tracker and site workbooks from Data\\ (or legacy locations) — no path setup needed.",
                  font=(FONT,8),bg="#1A2E18",fg="#86EFAC",justify="left",wraplength=520).pack(anchor="w")
         self.name_var=tk.StringVar(value=self.cfg.get("username",""))
         nc=tk.Frame(body,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); nc.pack(anchor="w",pady=(6,0))
@@ -2263,9 +2585,13 @@ class SetupWizard(tk.Toplevel):
                     status_txt="(status unavailable)"
                 sync_rows["status"].set(status_txt)
 
-                sp=bool(getattr(app,"_save_pending",False))
-                si=bool(getattr(app,"_save_in_progress",False))
-                sync_rows["save_queue"].set(f"pending={sp}, in_progress={si}")
+                cq  = getattr(app, "_change_queue", collections.deque())
+                si  = bool(getattr(app, "_save_in_progress", False))
+                n   = len(cq)
+                sync_rows["save_queue"].set(
+                    f"{n} change(s) queued, in_progress={si}"
+                    if n else ("writing…" if si else "idle")
+                )
                 sync_rows["retry"].set(str(getattr(app,"_save_retry_count",0)))
 
                 lock_hints=[]
@@ -2499,7 +2825,7 @@ class SetupWizard(tk.Toplevel):
         auto_excel, auto_sites = _auto_data_paths()
         excel=auto_excel; name=self.name_var.get().strip()
         if not excel:
-            messagebox.showwarning("Required","Cannot find Data\\query_tracker.xlsx next to the app.",parent=self); return
+            messagebox.showwarning("Required","Cannot find a query tracker workbook in Data\\ or next to the app.",parent=self); return
         if not name:
             messagebox.showwarning("Required","Please enter your name.",parent=self); return
         try:
@@ -2510,9 +2836,6 @@ class SetupWizard(tk.Toplevel):
                 "High-volume warning threshold must be a whole number greater than 0.",parent=self); return
         chosen_theme=getattr(self,"_selected_theme",None)
         chosen_theme=chosen_theme.get() if chosen_theme else self.cfg.get("theme","Slate & Teal")
-        # Paths are not stored in local config; app always resolves Data/ paths.
-        self.cfg.pop("excel_file", None)
-        self.cfg.pop("sites_file", None)
         self.cfg.update({
             "username":       name,
             "high_volume_threshold": hvt,
@@ -2580,6 +2903,12 @@ class QueryTrackerApp(tk.Tk):
             if getattr(self,"_save_retry_after_id",None):
                 self.after_cancel(self._save_retry_after_id)
                 self._save_retry_after_id=None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_sp_wait_after_id", None):
+                self.after_cancel(self._sp_wait_after_id)
+                self._sp_wait_after_id = None
         except Exception:
             pass
         self._do_daily_backup(forced=True)   # snapshot on exit
@@ -2724,7 +3053,11 @@ class QueryTrackerApp(tk.Tk):
         global QUERY_TYPES
         self.username=self.cfg.get("username","Unknown")
         self.login_name=(os.environ.get("USERNAME") or os.environ.get("USER") or "").strip()
-        self.excel_file,self.sites_file=_auto_data_paths()
+        auto_excel,auto_sites=_auto_data_paths()
+        cfg_excel=(self.cfg.get("excel_file", "") or "").strip()
+        cfg_sites=(self.cfg.get("sites_file", "") or "").strip()
+        self.excel_file=cfg_excel if (cfg_excel and os.path.exists(cfg_excel)) else auto_excel
+        self.sites_file=cfg_sites if (cfg_sites and os.path.exists(cfg_sites)) else auto_sites
         # Load query types and team members from the shared tracker so all
         # teammates automatically pick up any changes made by others.
         shared=load_shared_settings(self.excel_file)
@@ -2738,6 +3071,44 @@ class QueryTrackerApp(tk.Tk):
         apply_theme(self.cfg.get("theme","Slate & Teal"))
         self.clients,self.sites_by_client,self.meters,self.utilities_by_site,\
             self.funds_by_client,self.sites_by_fund=load_site_data(self.sites_file)
+
+        def _fund_count(funds_map):
+            try:
+                return sum(len(v) for v in (funds_map or {}).values())
+            except Exception:
+                return 0
+
+        loaded_funds=_fund_count(self.funds_by_client)
+
+        # Fund-specific source guard: if a companion sites workbook sits next
+        # to the active tracker and has richer fund data, prefer it.
+        try:
+            tracker_dir=os.path.dirname(self.excel_file or "")
+            companion_sites=os.path.join(tracker_dir, "sites.xlsx") if tracker_dir else ""
+            if companion_sites and companion_sites != self.sites_file and os.path.exists(companion_sites):
+                c3,sbc3,m3,u3,fbc3,sbf3=load_site_data(companion_sites)
+                companion_funds=_fund_count(fbc3)
+                if companion_funds > loaded_funds:
+                    self.sites_file=companion_sites
+                    self.clients,self.sites_by_client,self.meters,self.utilities_by_site = c3,sbc3,m3,u3
+                    self.funds_by_client,self.sites_by_fund = fbc3,sbf3
+                    loaded_funds=companion_funds
+        except Exception:
+            pass
+
+        # Fund-specific backward compatibility: older deployments used an
+        # explicit sites_file path in config. If auto-resolved path loads no
+        # fund values, retry with the legacy configured path.
+        if loaded_funds == 0:
+            legacy_sites=(self.cfg.get("sites_file", "") or "").strip()
+            if legacy_sites and legacy_sites != self.sites_file and os.path.exists(legacy_sites):
+                c2,sbc2,m2,u2,fbc2,sbf2=load_site_data(legacy_sites)
+                legacy_funds=_fund_count(fbc2)
+                if legacy_funds > 0:
+                    self.sites_file=legacy_sites
+                    self.clients,self.sites_by_client,self.meters,self.utilities_by_site = c2,sbc2,m2,u2
+                    self.funds_by_client,self.sites_by_fund = fbc2,sbf2
+
         self.queries=load_queries(self.excel_file)
         self._apply_escalation_rules()  # Apply escalation rules after loading
         self.recent_ids=[]
@@ -2755,12 +3126,20 @@ class QueryTrackerApp(tk.Tk):
         self._auto_reload_thread=None
         self._excel_mtime=self._get_excel_mtime()
         self._reload_tick=0
-        # Save queue state (auto-retry while file is locked/syncing)
-        self._save_pending=False
-        self._save_in_progress=False
-        self._save_retry_after_id=None
-        self._save_retry_count=0
-        self._save_conflict_snapshot_done=False
+        # Save queue – structured change queue for multi-user sync
+        # Each call to _save_queries() enqueues a ChangeRecord.  The queue is
+        # processed FIFO; one entry is written at a time.  After a successful
+        # write the app waits for SharePoint to propagate the file (mtime
+        # change) before processing the next entry, preventing back-to-back
+        # writes that would collide during OneDrive/SharePoint upload.
+        self._change_queue = collections.deque()    # ChangeRecord items
+        self._save_pending = False                  # True while queue non-empty
+        self._save_in_progress = False              # True during active write
+        self._save_retry_after_id = None            # scheduled retry after-id
+        self._save_retry_count = 0                  # consecutive retry count
+        self._save_conflict_snapshot_done = False   # snapshot written flag
+        self._sp_wait_after_id = None               # SharePoint propagation poll id
+        self._sp_wait_post_mtime = 0.0              # mtime recorded after write
         self._build_ui(); self.deiconify()
         self._refresh_table(); self._show_daily_banner()
         self._start_auto_reload()
@@ -2785,6 +3164,410 @@ class QueryTrackerApp(tk.Tk):
             if inner in (nm,lg) or lead in (nm,lg):
                 return True
         return False
+
+    def _norm_text(self, value):
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+    def _workbook_fund_values(self, client_name=""):
+        """Read fund values from column B in the sites workbook."""
+        sf=getattr(self,"sites_file","")
+        if not sf or not os.path.exists(sf):
+            return []
+
+        target=self._norm_text(client_name)
+        try:
+            wb=openpyxl.load_workbook(sf,data_only=True)
+        except Exception:
+            return []
+
+        ws=None
+        for name in ["Sites","Site","sites","site","Sheet1","Sheet"]:
+            if name in wb.sheetnames:
+                ws=wb[name]
+                break
+        if ws is None:
+            ws=wb.active
+
+        def _nh(v):
+            s=str(v or "").strip().lower()
+            return re.sub(r"\s+", " ", s)
+
+        aliases={"client": {"client"}}
+
+        header_map={}
+        header_row=None
+        best_score=-1
+        for r_i,row in enumerate(ws.iter_rows(min_row=1,max_row=80,values_only=True),start=1):
+            local={}
+            for idx,cell in enumerate(row):
+                nh=_nh(cell)
+                if not nh:
+                    continue
+                for key,vals in aliases.items():
+                    if nh in vals and key not in local:
+                        local[key]=idx
+            score=len(local)
+            if score>best_score and "client" in local:
+                best_score=score
+                header_map=local
+                header_row=r_i
+
+        if header_map:
+            c_idx=header_map.get("client",0)
+            f_idx=1
+            start=(header_row or 1)+1
+        else:
+            c_idx,f_idx,start=0,1,1
+
+        last_client=""
+        out=[]
+        for row in ws.iter_rows(min_row=start,values_only=True):
+            n=len(row)
+            def gv(i):
+                return str(row[i] or "").strip() if (i is not None and i<n) else ""
+
+            c=gv(c_idx)
+            f=gv(f_idx)
+            if c:
+                last_client=c
+            else:
+                c=last_client
+            if not f:
+                continue
+            if target and self._norm_text(c)!=target:
+                continue
+            out.append(f)
+
+        seen=set(); uniq=[]
+        for v in out:
+            k=self._norm_text(v)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            uniq.append(v)
+        uniq.sort(key=str.lower)
+        return uniq
+
+    def _column_b_fund_values(self):
+        """Last-resort fund extraction from column B of the sites workbook.
+
+        Some real-world site lists are too irregular for header mapping but
+        still keep Fund in column B. This bypasses client/site linking entirely.
+        """
+        sf=getattr(self,"sites_file","")
+        if not sf or not os.path.exists(sf):
+            return []
+
+        try:
+            wb=openpyxl.load_workbook(sf,data_only=True)
+        except Exception:
+            return []
+
+        ws=None
+        for name in ["Sites","Site","sites","site","Sheet1","Sheet"]:
+            if name in wb.sheetnames:
+                ws=wb[name]
+                break
+        if ws is None:
+            ws=wb.active
+
+        skip_exact={"fund","fund name","name of fund","column b","b"}
+        skip_contains={"example","must be","instruction","note:"}
+
+        out=[]
+        for row in ws.iter_rows(min_row=1, values_only=True):
+            val=str((row[1] if len(row)>1 else "") or "").strip()
+            if not val:
+                continue
+            low=val.lower()
+            if low in skip_exact:
+                continue
+            if any(tok in low for tok in skip_contains):
+                continue
+            out.append(val)
+
+        seen=set(); uniq=[]
+        for raw in out:
+            txt=str(raw or "").strip()
+            if not txt:
+                continue
+            key=self._norm_text(txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(txt)
+        uniq.sort(key=str.lower)
+        return uniq
+
+    def _read_sites_rows_column_b(self):
+        """Read (client, fund_from_col_b, site) tuples from the sites workbook."""
+        sf=getattr(self,"sites_file","")
+        if not sf or not os.path.exists(sf):
+            return []
+
+        try:
+            wb=openpyxl.load_workbook(sf,data_only=True)
+        except Exception:
+            return []
+
+        ws=None
+        for name in ["Sites","Site","sites","site","Sheet1","Sheet"]:
+            if name in wb.sheetnames:
+                ws=wb[name]
+                break
+        if ws is None:
+            ws=wb.active
+
+        def _nh(v):
+            return re.sub(r"\s+", " ", str(v or "").strip().lower())
+
+        aliases={
+            "client": {"client"},
+            "site": {"site", "site name"},
+        }
+
+        header_map={}
+        header_row=None
+        best_score=-1
+        for r_i,row in enumerate(ws.iter_rows(min_row=1,max_row=80,values_only=True),start=1):
+            local={}
+            for idx,cell in enumerate(row):
+                nh=_nh(cell)
+                if not nh:
+                    continue
+                for key,vals in aliases.items():
+                    if nh in vals and key not in local:
+                        local[key]=idx
+            score=len(local)
+            if score>best_score and "client" in local and "site" in local:
+                best_score=score
+                header_map=local
+                header_row=r_i
+
+        if header_map:
+            c_idx=header_map.get("client",0)
+            s_idx=header_map.get("site",3)
+            start=(header_row or 1)+1
+        else:
+            c_idx,s_idx,start=0,3,1
+
+        out=[]
+        last_client=""
+        last_fund_by_client={}
+        for row in ws.iter_rows(min_row=start,values_only=True):
+            n=len(row)
+            def gv(i):
+                return str(row[i] or "").strip() if (i is not None and i<n) else ""
+
+            client=gv(c_idx)
+            site=gv(s_idx)
+            fund=gv(1)
+
+            if client:
+                last_client=client
+            else:
+                client=last_client
+
+            if fund:
+                last_fund_by_client[client]=fund
+            else:
+                fund=last_fund_by_client.get(client,"")
+
+            if not client and not site and not fund:
+                continue
+            out.append((client,fund,site))
+
+        return out
+
+    def _column_b_funds_for_client(self, client_name):
+        target=self._norm_text(client_name)
+        if not target:
+            return []
+        vals=[]
+        for client,fund,_site in self._read_sites_rows_column_b():
+            if self._norm_text(client)!=target:
+                continue
+            if str(fund or "").strip():
+                vals.append(str(fund).strip())
+        seen=set(); out=[]
+        for v in vals:
+            k=self._norm_text(v)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(v)
+        out.sort(key=str.lower)
+        return out
+
+    def _column_b_sites_for_client_fund(self, client_name, fund_name):
+        c_target=self._norm_text(client_name)
+        f_target=self._norm_text(fund_name)
+        if not c_target or not f_target:
+            return []
+        vals=[]
+        for client,fund,site in self._read_sites_rows_column_b():
+            if self._norm_text(client)!=c_target or self._norm_text(fund)!=f_target:
+                continue
+            site_txt=str(site or "").strip()
+            if site_txt:
+                vals.append(site_txt)
+        seen=set(); out=[]
+        for v in vals:
+            k=self._norm_text(v)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(v)
+        out.sort(key=str.lower)
+        return out
+
+    def _column_b_fund_for_client_site(self, client_name, site_name):
+        c_target=self._norm_text(client_name)
+        s_target=self._norm_text(site_name)
+        if not c_target or not s_target:
+            return ""
+        for client,fund,site in self._read_sites_rows_column_b():
+            if self._norm_text(client)==c_target and self._norm_text(site)==s_target:
+                return str(fund or "").strip()
+        return ""
+
+    def _fund_values_for_client(self, client_name):
+        """Collect funds for a client from site list sources only."""
+        c_norm=self._norm_text(client_name)
+        values=[]
+
+        values.extend(self._column_b_funds_for_client(client_name))
+
+        for c_key,funds in self.funds_by_client.items():
+            if self._norm_text(c_key)==c_norm:
+                values.extend(funds)
+
+        for (c_key,f_key),_sites in self.sites_by_fund.items():
+            if self._norm_text(c_key)!=c_norm:
+                continue
+            f_txt=str(f_key or "").strip()
+            if f_txt:
+                values.append(f_txt)
+
+        for (c_key,_site),rows in self.meters.items():
+            if self._norm_text(c_key)!=c_norm:
+                continue
+            for r in rows:
+                f_txt=str(r.get("fund","") or "").strip()
+                if f_txt:
+                    values.append(f_txt)
+
+        if not any(str(v or "").strip() for v in values):
+            values.extend(self._workbook_fund_values(client_name))
+        if not any(str(v or "").strip() for v in values):
+            values.extend(self._column_b_fund_values())
+
+        seen=set(); out=[]
+        for raw in values:
+            txt=str(raw or "").strip()
+            if not txt:
+                continue
+            key=self._norm_text(txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(txt)
+        out.sort(key=str.lower)
+        return out
+
+    def _fund_filter_values(self, client="All"):
+        """Build fund filter values from site list data only."""
+        if client != "All":
+            return self._fund_values_for_client(client)
+
+        values=[]
+
+        # Aggregate from every known in-memory source. Do not rely only on
+        # self.clients because that list can temporarily be stale/empty while
+        # other structures already contain valid funds.
+        for funds in self.funds_by_client.values():
+            values.extend(funds)
+
+        for (_c_key,f_key),_sites in self.sites_by_fund.items():
+            f_txt=str(f_key or "").strip()
+            if f_txt:
+                values.append(f_txt)
+
+        for (_c_key,_site),rows in self.meters.items():
+            for r in rows:
+                f_txt=str(r.get("fund", "") or "").strip()
+                if f_txt:
+                    values.append(f_txt)
+
+        # Also include per-client consolidation for normalized matching.
+        seen_clients={self._norm_text(c): c for c in self.clients}
+        for c in seen_clients.values():
+            values.extend(self._fund_values_for_client(c))
+
+        if not any(str(v or "").strip() for v in values):
+            values.extend(self._workbook_fund_values(""))
+        if not any(str(v or "").strip() for v in values):
+            values.extend(self._column_b_fund_values())
+
+        seen=set(); out=[]
+        for raw in values:
+            txt=str(raw or "").strip()
+            if not txt:
+                continue
+            key=self._norm_text(txt)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(txt)
+        out.sort(key=str.lower)
+        return out
+
+    def _refresh_fund_filter_values(self, keep_current=True):
+        """Rebuild FUND filter combobox values from current data sources."""
+        ff=getattr(self,"filter_fund",None)
+        fc=getattr(self,"filter_client",None)
+        if ff is None:
+            return
+
+        current="All"
+        try:
+            current=ff.get() or "All"
+        except Exception:
+            current="All"
+
+        client_sel="All"
+        if fc is not None:
+            try:
+                client_sel=fc.get() or "All"
+            except Exception:
+                client_sel="All"
+
+        funds=self._fund_filter_values(client_sel)
+        if not funds and client_sel != "All":
+            funds=self._workbook_fund_values(client_sel)
+        if not funds:
+            funds=self._workbook_fund_values("")
+        if not funds:
+            funds=self._column_b_fund_values()
+        if not funds and getattr(self, "sites_file", "") and os.path.exists(self.sites_file):
+            # Hard fallback: if options are still empty, refresh site mappings
+            # from disk and recalculate before touching the combobox values.
+            try:
+                self.clients,self.sites_by_client,self.meters,self.utilities_by_site,\
+                    self.funds_by_client,self.sites_by_fund=load_site_data(self.sites_file)
+            except Exception:
+                pass
+            funds=self._fund_filter_values(client_sel)
+            if not funds:
+                funds=self._column_b_fund_values()
+
+        values=["All"]+funds
+        ff.configure(values=values)
+
+        if keep_current and current in values:
+            ff.set(current)
+        else:
+            ff.set("All")
 
     def _build_ui(self):
         # ── Top navigation bar ────────────────────────────────────────────────
@@ -2895,11 +3678,13 @@ class QueryTrackerApp(tk.Tk):
         self.filter_fund.set("All")
 
         def on_filter_client(e=None):
-            c=self.filter_client.get()
-            funds=self.funds_by_client.get(c,[]) if c!="All" else sorted({f for fl in self.funds_by_client.values() for f in fl})
-            self.filter_fund.configure(values=["All"]+funds); self.filter_fund.set("All"); self._schedule_list_refresh(0)
+            self._refresh_fund_filter_values(keep_current=False)
+            self._schedule_list_refresh(0)
         self.filter_client.bind("<<ComboboxSelected>>",on_filter_client)
+        self.filter_fund.bind("<Button-1>",lambda _e:self._refresh_fund_filter_values(keep_current=True))
+        self.filter_fund.bind("<FocusIn>",lambda _e:self._refresh_fund_filter_values(keep_current=True))
         self.filter_fund.bind("<<ComboboxSelected>>",lambda _:self._schedule_list_refresh(0))
+        self._refresh_fund_filter_values(keep_current=False)
 
         self.filter_type=_lbl_combo(frow_top,"TYPE",
             lambda p: make_combo(p,tk.StringVar(),["All"]+QUERY_TYPES,readonly=True,width=20))
@@ -2946,13 +3731,13 @@ class QueryTrackerApp(tk.Tk):
 
         tw=tk.Frame(lp,bg=BG); tw.pack(fill="both",expand=True,padx=20,pady=(10,0))
         card=tk.Frame(tw,bg=CARD,highlightthickness=1,highlightbackground=BORDER); card.pack(fill="both",expand=True)
-        cols=("ref","client","fund","site","utility","meter","type","status","priority","overdue","chase","raised","opened","assigned","last_by","att")
+        cols=("ref","client","fund","site","utility","meter","type","overview","status","priority","overdue","chase","raised","opened","assigned","last_by","att")
         self.tree=ttk.Treeview(card,columns=cols,show="headings",height=20,style="Modern.Treeview",selectmode="extended")
         self._sort_state={}
         for col,label,width,anchor in [
             ("ref","Reference",90,"w"),("client","Client",140,"w"),("fund","Fund",140,"w"),
             ("site","Site",155,"w"),("utility","Utility",90,"w"),("meter","Meter",130,"w"),
-            ("type","Type",140,"w"),("status","Status",100,"w"),("priority","Priority",75,"center"),
+            ("type","Type",140,"w"),("overview","Query Overview",180,"w"),("status","Status",100,"w"),("priority","Priority",75,"center"),
             ("overdue","Overdue",75,"center"),("chase","Next Action",110,"w"),
             ("raised","Raised",85,"w"),("opened","Logged",85,"w"),
             ("assigned","Assigned to",110,"w"),
@@ -3227,6 +4012,31 @@ class QueryTrackerApp(tk.Tk):
         self.out_of_office=self._normalize_out_of_office(self.out_of_office)
         self.cfg["out_of_office"]=self.out_of_office
         save_config(self.cfg)
+
+    def _is_member_out_of_office_on(self, member, day_str):
+        if not member or not day_str or not parse_iso_date(day_str):
+            return []
+        target=(member or "").strip().casefold()
+        if not target:
+            return []
+        hits=[]
+        for entry in getattr(self,"out_of_office",[]) or []:
+            if (entry.get("member","") or "").strip().casefold()!=target:
+                continue
+            if entry.get("date","")!=day_str:
+                continue
+            hits.append(entry)
+        return hits
+
+    def _assignee_availability_error(self, assignee, day_str):
+        if not assignee:
+            return ""
+        hits=self._is_member_out_of_office_on(assignee, day_str)
+        if not hits:
+            return ""
+        kinds=sorted({(h.get("type") or "Out of office").strip() or "Out of office" for h in hits})
+        summary=", ".join(kinds)
+        return f"{assignee} is unavailable on {fmt_date(day_str)} ({summary}). Choose another assignee or action date."
 
     def _show_sickness_reallocation_alert(self):
         today=today_str()
@@ -4733,12 +5543,12 @@ class QueryTrackerApp(tk.Tk):
             title_block(ws1,"Query Report — Full Detail",period_label)
 
             cols1=["Ref","Client","Fund","Site","Address 1","Town","Postcode","Utility","Meter",
-                   "Type","Status","Priority","Query Raised","Logged","Action Date","Resolved",
+                   "Type","Query Overview","Status","Priority","Query Raised","Logged","Action Date","Resolved",
                    "SLA Intake","Days Open","Description","Activity Log",
                    "Supply Point ID","Meter Serial","Contact","Prop Code",
                    "Assigned To","Last Updated By"]
             widths1=[12,24,22,26,26,16,12,14,20,
-                     20,14,10,12,12,12,12,
+                     20,24,14,10,12,12,12,12,
                      12,10,50,60,
                      18,14,24,12,
                      16,16]
@@ -4774,7 +5584,7 @@ class QueryTrackerApp(tk.Tk):
                 vals=[
                     q["ref"], q["client"], q.get("fund",""), q["site"],
                     q.get("address1",""), q.get("town",""), q.get("postcode",""), q.get("utility",""), q.get("meter",""),
-                    q["type"], q["status"], q["priority"],
+                    q["type"], q.get("query_overview",""), q["status"], q["priority"],
                     fmt_date(q.get("raised_date","")), fmt_date(q["opened"]),
                     fmt_date(q.get("chase_date","")),
                     fmt_date(q.get("resolved_date","")), intake, days,
@@ -4786,16 +5596,16 @@ class QueryTrackerApp(tk.Tk):
                 for c,v in enumerate(vals,1):
                     cell=ws1.cell(row=r,column=c,value=v)
                     cell.font=body_font; cell.border=bdr
-                    is_log=(c==18); is_desc=(c==17)
+                    is_log=(c==21); is_desc=(c==20)
                     cell.alignment=Alignment(vertical="top",wrap_text=(is_log or is_desc))
                 sf=status_fills.get(q["status"],"243040")
                 pf=priority_fills.get(q["priority"],"243040")
-                ws1.cell(row=r,column=9).fill=PatternFill("solid",fgColor=sf)
-                ws1.cell(row=r,column=9).font=Font(name=FONT,size=10,color="FFFFFF")
-                ws1.cell(row=r,column=10).fill=PatternFill("solid",fgColor=pf)
-                ws1.cell(row=r,column=10).font=Font(name=FONT,size=10,color="FFFFFF")
+                ws1.cell(row=r,column=12).fill=PatternFill("solid",fgColor=sf)
+                ws1.cell(row=r,column=12).font=Font(name=FONT,size=10,color="FFFFFF")
+                ws1.cell(row=r,column=13).fill=PatternFill("solid",fgColor=pf)
+                ws1.cell(row=r,column=13).font=Font(name=FONT,size=10,color="FFFFFF")
                 if intake != "":
-                    c15=ws1.cell(row=r,column=15)
+                    c15=ws1.cell(row=r,column=18)
                     sla_label="BREACHED" if intake>1 else ("1 day" if intake==1 else "MET")
                     c15.value=f"{intake}d — {sla_label}"
                     if intake>1: c15.fill=PatternFill("solid",fgColor="2E1111"); c15.font=Font(name=FONT,size=10,color="FCA5A5")
@@ -4893,7 +5703,7 @@ class QueryTrackerApp(tk.Tk):
             # One row per query, all fields, log as bullet points in one cell
             upload_cols=[
                 "Reference","Client","Fund","Site","Address 1","Town","Postcode",
-                "Utility","Meter","Query Type","Status","Priority",
+                "Utility","Meter","Query Type","Query Overview","Status","Priority",
                 "Query Raised","Logged","Action Date","Resolved Date",
                 "SLA Intake","Days Open",
                 "Description","Activity Notes",
@@ -4903,7 +5713,7 @@ class QueryTrackerApp(tk.Tk):
             ]
             upload_widths=[
                 12,26,22,28,26,16,12,
-                14,20,22,14,10,
+                14,20,22,28,14,10,
                 12,12,12,12,
                 12,10,
                 52,62,
@@ -4931,7 +5741,7 @@ class QueryTrackerApp(tk.Tk):
                     q["ref"], q["client"], q.get("fund",""), q["site"],
                     q.get("address1",""), q.get("town",""), q.get("postcode",""),
                     q.get("utility",""), q.get("meter",""),
-                    q["type"], q["status"], q["priority"],
+                    q["type"], q.get("query_overview",""), q["status"], q["priority"],
                     fmt_date(q.get("raised_date","")),
                     fmt_date(q["opened"]),
                     fmt_date(q.get("chase_date","")),
@@ -5078,9 +5888,10 @@ class QueryTrackerApp(tk.Tk):
     def _silent_reload(self):
         """Reload queries from disk without disrupting any open dialogs."""
         try:
-            if getattr(self,"_save_pending",False):
+            if self._change_queue or getattr(self, "_save_in_progress", False):
                 try:
-                    self.sync_lbl.config(text="… Refresh paused (save queued)")
+                    n = len(self._change_queue)
+                    self.sync_lbl.config(text=f"… Refresh paused ({n} change(s) queued)")
                 except Exception:
                     pass
                 return
@@ -5111,6 +5922,10 @@ class QueryTrackerApp(tk.Tk):
                 except Exception:
                     focus_widget=None
                 typing_widget=isinstance(focus_widget,(tk.Entry,ttk.Entry,ttk.Combobox)) if focus_widget else False
+                try:
+                    self._refresh_fund_filter_values(keep_current=True)
+                except Exception:
+                    pass
                 if getattr(self,"_current_page","")=="list" and self._app_has_focus() and not typing_widget:
                     self._refresh_table()
                     # Restore any filter that was unexpectedly cleared
@@ -5226,8 +6041,33 @@ class QueryTrackerApp(tk.Tk):
         if q:
             self._file_to_query(fpath, display_name, q)
         else:
-            # Small delay lets any active grab settle before showing dialog
-            self.after(500, lambda: self._ask_assign_query(fpath, display_name))
+            # Don't interrupt background users with assignment popups.
+            if self._app_has_focus():
+                # Small delay lets any active grab settle before showing dialog.
+                self.after(500, lambda: self._ask_assign_query(fpath, display_name))
+            else:
+                moved=self._move_to_unmatched(fpath, display_name)
+                if moved:
+                    _show_toast(self, f"Unmatched file parked: {display_name[:46]}", color="#1A2E48", duration=3500)
+
+    def _move_to_unmatched(self, fpath, display_name=None):
+        if not fpath:
+            return None
+        fname=(display_name or os.path.basename(fpath) or "attachment").strip()
+        if fname.lower().endswith(".qbclaim"):
+            fname=fname[:-len(".qbclaim")]
+        if not fname:
+            fname="attachment"
+        um=os.path.join(os.path.dirname(fpath), "_UNMATCHED")
+        os.makedirs(um, exist_ok=True)
+        base,ext=os.path.splitext(fname)
+        dest=os.path.join(um, fname)
+        idx=1
+        while os.path.exists(dest):
+            dest=os.path.join(um, f"{base}_{idx}{ext}")
+            idx+=1
+        shutil.move(fpath, dest)
+        return dest
 
 
     def _file_to_query(self, fpath, fname, q):
@@ -5237,7 +6077,7 @@ class QueryTrackerApp(tk.Tk):
                 os.remove(fpath)
                 self._att_count_cache.pop(q.get("id",""),None)
                 q["log"] += " | " + stamp(self.username) + f" Auto-filed attachment: {dest_name}"
-                self._save_queries()
+                self._save_queries(change_type="attachment", query_id=q.get("id",""), description=f"Attachment: {dest_name} -> {q.get('ref','')}")
                 self._refresh_list_if_visible()
                 _show_toast(self,
                     f"✓  Filed under {q['ref']}\n{dest_name}",
@@ -5246,9 +6086,7 @@ class QueryTrackerApp(tk.Tk):
                 # save_attachment returned None (e.g. no attachment folder configured) —
                 # move claim file to _UNMATCHED so it isn't lost
                 try:
-                    um = os.path.join(os.path.dirname(fpath), "_UNMATCHED")
-                    os.makedirs(um, exist_ok=True)
-                    shutil.move(fpath, os.path.join(um, fname))
+                    self._move_to_unmatched(fpath, fname)
                 except Exception:
                     pass
         except Exception as e:
@@ -5256,9 +6094,7 @@ class QueryTrackerApp(tk.Tk):
                         color=DANGER, duration=5000)
             # Clean up the claim file so it doesn't block the folder
             try:
-                um = os.path.join(os.path.dirname(fpath), "_UNMATCHED")
-                os.makedirs(um, exist_ok=True)
-                shutil.move(fpath, os.path.join(um, fname))
+                self._move_to_unmatched(fpath, fname)
             except Exception:
                 pass
 
@@ -5321,9 +6157,7 @@ class QueryTrackerApp(tk.Tk):
 
         def discard():
             try:
-                um = os.path.join(os.path.dirname(fpath), "_UNMATCHED")
-                os.makedirs(um, exist_ok=True)
-                shutil.move(fpath, os.path.join(um, fname))
+                self._move_to_unmatched(fpath, fname)
             except: pass
             dlg.destroy()
 
@@ -5378,13 +6212,14 @@ class QueryTrackerApp(tk.Tk):
         today=today_str(); result=[]
         af=getattr(self,"_assignee_filter","")
         day_filter=getattr(self,"_calendar_day_filter","")
+        ff_norm=self._norm_text(ff)
         for q in self.queries:
             overdue=q["status"]!="Resolved" and q.get("chase_date","") and q["chase_date"]<=today
             if tab=="action" and not overdue: continue
             if tab=="open"   and q["status"]=="Resolved": continue
             if tab=="resolved" and q["status"]!="Resolved": continue
             if fc!="All" and q["client"]!=fc: continue
-            if ff!="All" and q.get("fund","")!=ff: continue
+            if ff!="All" and self._norm_text(q.get("fund", ""))!=ff_norm: continue
             if ft!="All" and q["type"]!=ft: continue
             if fs!="All" and q["status"]!=fs: continue
             if fu!="All" and q.get("utility","")!=fu: continue
@@ -5392,7 +6227,7 @@ class QueryTrackerApp(tk.Tk):
             if af and q.get("assigned_to","")!=af: continue
             if day_filter and q.get("chase_date","")!=day_filter: continue
             if search and search not in (q["ref"]+q["client"]+q.get("fund","")+q["site"]+
-                                         q["desc"]+q["type"]+q["utility"]+q["meter"]).lower(): continue
+                                         q["desc"]+q.get("query_overview","")+q["type"]+q["utility"]+q["meter"]).lower(): continue
             result.append(q)
 
         if tab=="action":
@@ -5446,7 +6281,7 @@ class QueryTrackerApp(tk.Tk):
             raised_disp=fmt_date(q.get("raised_date","")) if q.get("raised_date") else "—"
             self.tree.insert("","end",iid=q["id"],
                 values=(q["ref"],q["client"],q.get("fund",""),q["site"],q["utility"],q["meter"],
-                        q["type"],q["status"],q["priority"],overdue_disp,chase_disp,
+                        q["type"],q.get("query_overview",""),q["status"],q["priority"],overdue_disp,chase_disp,
                         raised_disp,fmt_date(q["opened"]),q.get("assigned_to",""),q.get("last_by",""),att_disp),tags=(tag,))
         if getattr(self,"_metrics_dirty",True):
             self._refresh_metrics()
@@ -5595,7 +6430,7 @@ class QueryTrackerApp(tk.Tk):
                      font=(FONT,9),bg=CARD2,fg=MUTED).pack(side="left")
 
             def mark_read():
-                if getattr(self,"_save_pending",False) or getattr(self,"_save_in_progress",False):
+                if self._change_queue or getattr(self,"_save_in_progress",False):
                     self.after(1200, mark_read)
                     return
                 lock_fd=None
@@ -5717,6 +6552,7 @@ class QueryTrackerApp(tk.Tk):
     def _clear_filters(self,refresh=True):
         self.search_var.set("")
         self.filter_client.set("All"); self.filter_fund.set("All")
+        self._refresh_fund_filter_values(keep_current=False)
         self.filter_type.set("All"); self.filter_status.set("All")
         try: self.filter_assignee.set("All")
         except: pass
@@ -5872,6 +6708,29 @@ class QueryTrackerApp(tk.Tk):
             action = action_var.get()
             updated_count = 0
 
+            if action == "assign":
+                candidate = assign_var.get()
+                if candidate == "(Unassigned)":
+                    candidate = ""
+                if candidate:
+                    blocked = []
+                    for qid in selected_ids:
+                        query = next((q for q in self.queries if q['id'] == qid), None)
+                        if not query:
+                            continue
+                        day = query.get("chase_date", "")
+                        if self._assignee_availability_error(candidate, day):
+                            blocked.append((query.get("ref", ""), day))
+                    if blocked:
+                        sample = "\n".join(f"• {ref or '(No ref)'} on {fmt_date(day)}" for ref, day in blocked[:8])
+                        more = "" if len(blocked) <= 8 else f"\n• +{len(blocked)-8} more"
+                        messagebox.showwarning(
+                            "Assignee unavailable",
+                            f"{candidate} is unavailable on one or more selected action dates.\n\n{sample}{more}",
+                            parent=dlg,
+                        )
+                        return
+
             if action == "chase":
                 new_chase = chase_var.get().strip()
                 if not self._validate_action_date(new_chase, parent=dlg):
@@ -5945,7 +6804,7 @@ class QueryTrackerApp(tk.Tk):
                         updated_count += 1
             
             if updated_count > 0:
-                self._save_queries()
+                self._save_queries(change_type="query_update", description=f"Bulk action-date update ({updated_count} queries)")
                 self._refresh_table()
                 self._refresh_dashboard()
                 self._show_daily_banner()
@@ -5962,7 +6821,7 @@ class QueryTrackerApp(tk.Tk):
         self._sort_state={c:True for c in self._sort_state}
         self._sort_state[col]=asc
         col_labels={"ref":"Reference","client":"Client","fund":"Fund","site":"Site","utility":"Utility",
-                    "meter":"Meter","type":"Type","status":"Status","priority":"Priority",
+                    "meter":"Meter","type":"Type","overview":"Query Overview","status":"Status","priority":"Priority",
                     "overdue":"Overdue","chase":"Next Action","raised":"Raised",
                     "opened":"Logged","assigned":"Assigned to","last_by":"Last updated by","att":"📎"}
         for c,lbl in col_labels.items():
@@ -5972,18 +6831,79 @@ class QueryTrackerApp(tk.Tk):
         items.sort(reverse=not asc)
         for idx,(_,iid) in enumerate(items): self.tree.move(iid,"",idx)
 
-    def _save_queries(self):
-        """Queue save to Excel and retry automatically while file is locked/syncing."""
+    def _save_queries(self, change_type="query_update", query_id="", description=""):
+        """Enqueue a change and start processing the save queue.
+
+        Every user action that modifies data calls this method.  Callers
+        should pass *change_type* and *query_id* so the queue can apply a
+        targeted (query-level) merge instead of rewriting the full workbook
+        from in-memory state, which would overwrite concurrent edits by other
+        users on different machines.
+
+        change_type values: "query_add" | "query_edit" | "query_delete" |
+                            "attachment" | "query_update" | "settings"
+        """
         if not self.excel_file:
             messagebox.showerror("Save failed","No query tracker file is configured.",parent=self)
             return False
-        self._save_pending=True
-        self._dash_dirty=True
-        self._rpt_dirty=True
-        self._list_dirty=True
-        self._metrics_dirty=True
-        self._flush_save_queue()
+        self._enqueue_change(change_type, query_id, description)
         return True
+
+    def _enqueue_change(self, change_type, query_id, description):
+        """Create a ChangeRecord and append it to the save queue.
+
+        The record carries a snapshot of the affected query at the moment the
+        user pressed Save.  This is used by _apply_change_to_disk() to write
+        only that query's data rather than the entire in-memory list.
+
+        Queue ordering:
+          • Within one machine: strictly FIFO (deque.append preserves order).
+          • Across machines: the .qblock advisory lock determines who writes
+            first.  The machine that acquires the lock commits its front-of-
+            queue entry; the other machine retries and then applies its entry
+            on top of the already-updated file.
+          • Simultaneous same-machine saves: the deque preserves submission
+            order, so pressing Save on query A then query B means A is written
+            first regardless of how quickly SharePoint syncs.
+        """
+        qid_str = str(query_id) if query_id else ""
+        # Capture the current state of the affected query as a snapshot
+        data_snapshot = None
+        if qid_str:
+            data_snapshot = next(
+                (dict(q) for q in self.queries if str(q.get("id","")) == qid_str),
+                None
+            )
+        record = ChangeRecord(
+            queued_at     = time.time(),
+            machine       = MACHINE_NAME,
+            change_type   = change_type,
+            query_id      = qid_str,
+            description   = description or change_type,
+            data_snapshot = data_snapshot,
+        )
+        self._change_queue.append(record)
+        self._save_pending = True
+        self._dash_dirty   = True
+        self._rpt_dirty    = True
+        self._list_dirty   = True
+        self._metrics_dirty= True
+        self._update_queue_label()
+        if not getattr(self, "_save_in_progress", False):
+            self._flush_save_queue()
+
+    def _update_queue_label(self):
+        """Refresh the status-bar label to reflect current queue depth."""
+        n = len(self._change_queue)
+        try:
+            if n == 0:
+                pass  # caller will set "✓ Saved" or "● Live"
+            elif n == 1:
+                self.sync_lbl.config(text="… Saving 1 change")
+            else:
+                self.sync_lbl.config(text=f"… {n} changes queued")
+        except Exception:
+            pass
 
     def _save_recovery_snapshot(self, reason=""):
         """Write a timestamped recovery copy of in-memory queries.
@@ -6009,82 +6929,183 @@ class QueryTrackerApp(tk.Tk):
                 self.after_cancel(self._save_retry_after_id)
         except Exception:
             pass
-        self._save_retry_after_id=self.after(delay_ms,self._flush_save_queue)
+        self._save_retry_after_id = self.after(delay_ms, self._flush_save_queue)
 
     def _flush_save_queue(self):
-        if not getattr(self,"_save_pending",False):
-            return
-        if getattr(self,"_save_in_progress",False):
-            return
-        self._save_in_progress=True
-        try:
-            save_all_queries(self.queries,self.excel_file)
-            self._save_pending=False
-            self._save_retry_count=0
-            self._save_conflict_snapshot_done=False
-            self._excel_mtime=self._excel_mtime_now()
+        """Process the front-of-queue ChangeRecord.
+
+        Only one entry is written per call.  On success the entry is removed
+        and the app waits for SharePoint to propagate the write (mtime change)
+        before processing the next entry — preventing overlapping uploads that
+        would trigger the "We need to refresh your file" conflict dialog.
+
+        On PermissionError (file locked by Excel / another instance) the entry
+        stays at the front of the queue and a retry is scheduled with backoff.
+        """
+        if not self._change_queue:
+            self._save_pending = False
             try:
-                self.sync_lbl.config(text="✓ Saved")
-                self.after(2500,lambda:self.sync_lbl.config(text="● Live") if self.sync_lbl.winfo_exists() else None)
+                self.sync_lbl.config(text="● Live")
             except Exception:
                 pass
-        except PermissionError:
-            self._save_retry_count += 1
-            hints=[]
+            return
+        if getattr(self, "_save_in_progress", False):
+            return
+
+        self._save_in_progress = True
+        record = self._change_queue[0]   # peek – do not remove until success
+
+        try:
+            # Build the merged query list for this specific change only
+            merged = _apply_change_to_disk(record, self.excel_file, self.queries)
+            save_all_queries(merged, self.excel_file, _pre_merged=True)
+
+            # ── Success ────────────────────────────────────────────────────
+            self._change_queue.popleft()          # commit
+            self._save_retry_count       = 0
+            self._save_conflict_snapshot_done = False
             try:
-                folder=os.path.dirname(self.excel_file)
-                base=os.path.basename(self.excel_file)
+                self._sp_wait_post_mtime = os.path.getmtime(self.excel_file)
+            except Exception:
+                self._sp_wait_post_mtime = 0.0
+            self._excel_mtime = self._excel_mtime_now()
+
+            remaining = len(self._change_queue)
+            if remaining == 0:
+                self._save_pending = False
+                try:
+                    self.sync_lbl.config(text="✓ Saved")
+                    self.after(2500, lambda: self.sync_lbl.config(text="● Live")
+                               if getattr(self, "sync_lbl", None) and self.sync_lbl.winfo_exists() else None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.sync_lbl.config(text=f"✓ Saved — {remaining} more in queue")
+                except Exception:
+                    pass
+                # Wait for SharePoint to upload before writing the next entry.
+                # This avoids the "Save Again" version-conflict dialog that
+                # Excel shows when two writes arrive before OneDrive can sync.
+                self._wait_for_sharepoint_propagation(self._sp_wait_post_mtime)
+
+        except PermissionError:
+            # File is held by Excel or another instance – keep at front and retry
+            self._save_retry_count += 1
+            hints = []
+            try:
+                folder = os.path.dirname(self.excel_file)
+                base   = os.path.basename(self.excel_file)
                 if os.path.exists(os.path.join(folder, f"~${base}")):
                     hints.append("Excel lock file")
                 try:
-                    names=os.listdir(folder)
-                    stem=os.path.splitext(base)[0].lower()
-                    if any(stem in n.lower() and ("conflict" in n.lower() or "conflicted" in n.lower()) for n in names):
+                    names = os.listdir(folder)
+                    stem  = os.path.splitext(base)[0].lower()
+                    if any(stem in n.lower() and
+                           ("conflict" in n.lower() or "conflicted" in n.lower()) for n in names):
                         hints.append("conflicted copy detected")
                 except Exception:
                     pass
             except Exception:
                 pass
+
             if self._save_retry_count == 1:
                 _show_toast(
                     self,
-                    "Save queued: close query_tracker.xlsx in Excel if open.\n"
+                    "Save queued — close query_tracker.xlsx in Excel if open.\n"
                     "Opening the live tracker during app edits can cause SharePoint version conflicts.",
                     color=WARNING,
                     duration=6500,
                 )
-            if self._save_retry_count >= 5 and not getattr(self,"_save_conflict_snapshot_done",False):
-                snap=self._save_recovery_snapshot("file busy")
-                self._save_conflict_snapshot_done=True
+            if self._save_retry_count >= 5 and not getattr(self, "_save_conflict_snapshot_done", False):
+                snap = self._save_recovery_snapshot("file busy")
+                self._save_conflict_snapshot_done = True
                 if snap:
-                    _show_toast(self,f"Recovery snapshot saved:\n{os.path.basename(snap)}",color="#1A2E48",duration=7000)
-            suffix=f"  ·  {'; '.join(hints)}" if hints else ""
-            try: self.sync_lbl.config(text=f"… Save queued (busy x{self._save_retry_count}){suffix}")
-            except Exception: pass
-            # Back off slightly under lock contention to reduce sync churn.
-            retry_ms=min(12000, 3000 + max(0, self._save_retry_count-1)*1000)
+                    _show_toast(self, f"Recovery snapshot saved:\n{os.path.basename(snap)}",
+                                color="#1A2E48", duration=7000)
+
+            n       = len(self._change_queue)
+            suffix  = f"  ·  {'; '.join(hints)}" if hints else ""
+            desc    = record.description
+            try:
+                self.sync_lbl.config(
+                    text=f"… {n} queued · retry {self._save_retry_count} · {desc}{suffix}"
+                )
+            except Exception:
+                pass
+            retry_ms = min(12000, 3000 + max(0, self._save_retry_count - 1) * 1000)
             self._schedule_save_retry(retry_ms)
+
         except Exception as exc:
             self._save_retry_count += 1
             if self._save_retry_count <= 1:
-                _show_toast(self,f"Save queued: {exc}",color=WARNING,duration=4000)
-            try: self.sync_lbl.config(text="… Save queued (retrying)")
-            except Exception: pass
-            retry_ms=min(12000, 3000 + max(0, self._save_retry_count-1)*1000)
+                _show_toast(self, f"Save queued: {exc}", color=WARNING, duration=4000)
+            n = len(self._change_queue)
+            try:
+                self.sync_lbl.config(text=f"… {n} queued · retrying")
+            except Exception:
+                pass
+            retry_ms = min(12000, 3000 + max(0, self._save_retry_count - 1) * 1000)
             self._schedule_save_retry(retry_ms)
+
         finally:
-            self._save_in_progress=False
+            self._save_in_progress = False
+
+    # SharePoint propagation time = how long after a write we wait for the
+    # file's mtime to change before processing the next queue entry.
+    _SP_PROPAGATION_TIMEOUT = 20.0   # seconds – give SharePoint up to 20 s
+
+    def _wait_for_sharepoint_propagation(self, post_write_mtime, deadline=None):
+        """Poll the tracker file's mtime until SharePoint has uploaded the write.
+
+        After a successful save the file's mtime will change once OneDrive /
+        SharePoint has uploaded it.  We wait for that change before writing the
+        next queued entry, which prevents the "We need to refresh your file –
+        Click Save" version-conflict dialog in Excel.
+
+        If the file has not changed within _SP_PROPAGATION_TIMEOUT seconds we
+        proceed anyway so the queue never stalls permanently.
+        """
+        if deadline is None:
+            deadline = time.time() + self._SP_PROPAGATION_TIMEOUT
+
+        if time.time() > deadline:
+            # Timeout – propagation may not be detectable (offline, local sync etc.)
+            self._flush_save_queue()
+            return
+
+        try:
+            have_changed = os.path.getmtime(self.excel_file) != post_write_mtime
+        except Exception:
+            have_changed = True   # file removed / error → proceed
+
+        if have_changed:
+            # SharePoint has accepted the upload – safe to write the next entry
+            self._excel_mtime = self._excel_mtime_now()
+            n = len(self._change_queue)
+            if n:
+                try:
+                    self.sync_lbl.config(text=f"↑ Synced — {n} more in queue")
+                except Exception:
+                    pass
+            self._flush_save_queue()
+        else:
+            # Not yet uploaded – poll again in 1 s
+            self._sp_wait_after_id = self.after(
+                1000,
+                lambda: self._wait_for_sharepoint_propagation(post_write_mtime, deadline)
+            )
 
     def _reload_sites(self):
         self.clients,self.sites_by_client,self.meters,self.utilities_by_site,\
             self.funds_by_client,self.sites_by_fund=load_site_data(self.sites_file)
         self.filter_client.configure(values=["All"]+self.clients)
-        self.filter_fund.configure(values=["All"]); self.filter_fund.set("All")
+        self._refresh_fund_filter_values(keep_current=False)
         messagebox.showinfo("Reloaded",f"{len(self.clients)} clients · {sum(len(v) for v in self.sites_by_client.values())} sites loaded.")
 
     def _reorganize_existing_attachments(self):
         if not self.sites_file:
-            messagebox.showerror("No sites file", "Cannot find sites.xlsx. Check the path in Settings.", parent=self)
+            messagebox.showerror("No sites file", "Cannot find a site workbook. Check Settings diagnostics.", parent=self)
             return
         if self.sites_file.startswith("http://") or self.sites_file.startswith("https://"):
             messagebox.showerror(
@@ -6116,7 +7137,11 @@ class QueryTrackerApp(tk.Tk):
     def _open_settings(self):
         def on_complete(cfg):
             self.cfg=cfg; self.username=cfg.get("username","Unknown")
-            self.excel_file,self.sites_file=_auto_data_paths()
+            auto_excel,auto_sites=_auto_data_paths()
+            cfg_excel=(cfg.get("excel_file", "") or "").strip()
+            cfg_sites=(cfg.get("sites_file", "") or "").strip()
+            self.excel_file=cfg_excel if (cfg_excel and os.path.exists(cfg_excel)) else auto_excel
+            self.sites_file=cfg_sites if (cfg_sites and os.path.exists(cfg_sites)) else auto_sites
             shared=load_shared_settings(self.excel_file)
             raw=shared.get("team_members") or cfg.get("team_members",[])
             self.team_members=raw if raw else [self.username]
@@ -6128,6 +7153,101 @@ class QueryTrackerApp(tk.Tk):
             self._refresh_table(); self._show_daily_banner()
             self._refresh_dashboard()
         SetupWizard(self,existing_cfg=self.cfg,on_complete=on_complete)
+
+    def _resolve_fund_for_site(self, client_name, site_name):
+        """Best-effort resolver for Fund from live sites workbook.
+
+        This is used as a final UI fallback when in-memory mappings miss fund
+        for a selected site due to non-standard row shapes or merged cells.
+        """
+        def _norm(v):
+            return re.sub(r"\s+", " ", str(v or "").strip()).casefold()
+
+        client_name=(client_name or "").strip()
+        site_name=(site_name or "").strip()
+        if not client_name or not site_name:
+            return ""
+        sf=getattr(self,"sites_file","")
+        if not sf or not os.path.exists(sf):
+            return ""
+        try:
+            wb=openpyxl.load_workbook(sf,data_only=True)
+        except Exception:
+            return ""
+
+        ws=None
+        for name in ["Sites","Site","sites","site","Sheet1","Sheet"]:
+            if name in wb.sheetnames:
+                ws=wb[name]
+                break
+        if ws is None:
+            ws=wb.active
+
+        def _nh(v):
+            s=str(v or "").strip().lower()
+            return re.sub(r"\s+", " ", s)
+
+        aliases={
+            "client": {"client"},
+            "site": {"site", "site name"},
+        }
+
+        header_map={}
+        header_row=None
+        best_score=-1
+        for r_i,row in enumerate(ws.iter_rows(min_row=1,max_row=80,values_only=True),start=1):
+            local={}
+            for idx,cell in enumerate(row):
+                nh=_nh(cell)
+                if not nh:
+                    continue
+                for key,vals in aliases.items():
+                    if nh in vals and key not in local:
+                        local[key]=idx
+            score=len(local)
+            if score>best_score and "client" in local and "site" in local:
+                best_score=score
+                header_map=local
+                header_row=r_i
+
+        if header_map:
+            c_idx=header_map.get("client",0)
+            s_idx=header_map.get("site",3)
+            f_idx=1
+            start=(header_row or 1)+1
+        else:
+            c_idx,s_idx,f_idx,start=0,3,1,1
+
+        last_client=""
+        last_fund_by_client={}
+        c_target=_norm(client_name)
+        s_target=_norm(site_name)
+
+        for row in ws.iter_rows(min_row=start,values_only=True):
+            n=len(row)
+            def gv(i):
+                return str(row[i] or "").strip() if (i is not None and i<n) else ""
+
+            c=gv(c_idx)
+            s=gv(s_idx)
+            f=gv(f_idx)
+
+            if c:
+                last_client=c
+            else:
+                c=last_client
+            if f:
+                last_fund_by_client[c]=f
+            else:
+                f=last_fund_by_client.get(c,"")
+
+            if not c or not s:
+                continue
+
+            if _norm(c)==c_target and _norm(s)==s_target:
+                return f
+
+        return ""
 
     def _labeled_combo(self,parent,label,var,values,readonly=False):
         f=tk.Frame(parent,bg=BG); f.pack(fill="x",pady=4)
@@ -6163,9 +7283,17 @@ class QueryTrackerApp(tk.Tk):
                     cb.icursor("end")
                 except: pass
         def on_focusout(e):
-            # Restore full list so dropdown isn't permanently filtered
-            cb.configure(values=get_full_list())
-            if cb.get() in get_full_list() and on_select: on_select()
+            # Delay restoring values to avoid a FocusOut/selection race where
+            # clicking a filtered item can resolve to a different entry.
+            def _restore():
+                full=get_full_list()
+                cb.configure(values=full)
+                if cb.get() in full and on_select:
+                    on_select()
+            try:
+                cb.after(120, _restore)
+            except Exception:
+                pass
         def on_selected(e):
             cb.configure(values=get_full_list())
             if on_select: on_select()
@@ -6217,8 +7345,12 @@ class QueryTrackerApp(tk.Tk):
         def open_new_site_dialog():
             """Dedicated dialog to add a new client/site — saves to sites.xlsx and pre-fills the form."""
             ns=tk.Toplevel(dlg); ns.title("Add new site")
-            ns.geometry("520x640"); ns.configure(bg=BG); ns.grab_set(); ns.resizable(False,True)
-            ns.minsize(520,500)
+            sw=ns.winfo_screenwidth(); sh=ns.winfo_screenheight()
+            cw=min(520,max(460,sw-80)); ch=min(620,max(460,sh-120))
+            px=max(0,min(dlg.winfo_rootx()+40,sw-cw-20)); py=max(0,min(dlg.winfo_rooty()+30,sh-ch-40))
+            ns.geometry(f"{cw}x{ch}+{px}+{py}")
+            ns.configure(bg=BG); ns.grab_set(); ns.resizable(False,True)
+            ns.minsize(460,460)
             hdr_ns=tk.Frame(ns,bg=NAV,padx=20,pady=14); hdr_ns.pack(fill="x")
             tk.Label(hdr_ns,text="＋  Add new site",font=(FONT,12,"bold"),bg=NAV,fg=TEXT).pack(anchor="w")
             tk.Label(hdr_ns,text="Fill in the details — this will be saved to your site list.",
@@ -6302,7 +7434,7 @@ class QueryTrackerApp(tk.Tk):
                 client_var.set(client_val)
                 site_cb.configure(values=self.sites_by_client.get(client_val,[]))
                 site_var.set(site_val)
-                fund_cb.configure(values=self.funds_by_client.get(client_val,[]))
+                fund_cb.configure(values=self._fund_values_for_client(client_val))
                 if ns_fund.get().strip(): fund_var.set(ns_fund.get().strip())
                 if ns_addr.get().strip(): address1_var.set(ns_addr.get().strip())
                 if ns_town.get().strip(): town_var.set(ns_town.get().strip())
@@ -6336,6 +7468,53 @@ class QueryTrackerApp(tk.Tk):
 
         site_cb  =self._labeled_combo(form,"Site *",site_var,[],readonly=False)
         fund_cb  =self._labeled_combo(form,"Fund",fund_var,[],readonly=False)
+        fund_hint_lbl=tk.Label(form,text="",font=(FONT,8),bg=BG,fg=WARNING,anchor="w",justify="left",wraplength=560)
+        fund_hint_lbl.pack(fill="x",pady=(0,2))
+
+        # ── DEBUG INFO PANEL ────────────────────────────────────────────────
+        debug_lbl=tk.Label(form,text="",font=(FONT,7),bg=BG,fg=MUTED,anchor="nw",justify="left",wraplength=560)
+        debug_lbl.pack(fill="x",pady=(0,4))
+
+        def _update_debug(*_):
+            """Update debug panel with current state."""
+            c=client_var.get().strip()
+            f=fund_var.get().strip()
+            s=site_var.get().strip()
+            sf=getattr(self,"sites_file","") or "(not set)"
+            lines=[f"[DEBUG] Sites file: {sf}"]
+            if c:
+                lines.append(f"Client: {c}")
+                cb_funds=self._column_b_funds_for_client(c)
+                lines.append(f"  Funds from Column B: {cb_funds}")
+                if f:
+                    lines.append(f"Fund: {f}")
+                    cb_sites=self._column_b_sites_for_client_fund(c,f)
+                    lines.append(f"  Sites for {c}+{f}: {cb_sites}")
+                    if s:
+                        lines.append(f"Site: {s}")
+                        cb_fund=self._column_b_fund_for_client_site(c,s)
+                        lines.append(f"  Fund for {c}+{s}: {cb_fund}")
+            debug_lbl.config(text="\n".join(lines))
+
+        def _set_fund_hint(values):
+            if values:
+                fund_hint_lbl.config(text="")
+                return
+            sf=getattr(self,"sites_file","") or "(not set)"
+            fund_hint_lbl.config(text=f"No fund values detected from site workbook. Current file: {sf}")
+
+        try:
+            all_funds=self._fund_filter_values("All")
+            if not all_funds and getattr(self, "sites_file", "") and os.path.exists(self.sites_file):
+                self.clients,self.sites_by_client,self.meters,self.utilities_by_site,\
+                    self.funds_by_client,self.sites_by_fund=load_site_data(self.sites_file)
+                all_funds=self._fund_filter_values("All")
+            if not all_funds:
+                all_funds=self._column_b_fund_values()
+            fund_cb.configure(values=all_funds,state="normal")
+            _set_fund_hint(all_funds)
+        except Exception:
+            pass
 
         utility_cb=self._labeled_combo(form,"Utility type *",utility_var,[],readonly=True)
         meter_cb =self._labeled_combo(form,"Specific meter",meter_var,[])
@@ -6455,6 +7634,24 @@ class QueryTrackerApp(tk.Tk):
             pady=4,
         ).pack(side="left",padx=(4,0))
 
+        tk.Label(form,text="Query Overview",font=(FONT,9),bg=BG,fg=MUTED).pack(anchor="w",pady=(8,4))
+        oc=tk.Frame(form,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); oc.pack(fill="x")
+        overview_text=tk.Text(
+            oc,
+            font=(FONT,10),
+            bg=CARD2,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            bd=8,
+            height=2,
+            wrap="word",
+            highlightthickness=0,
+        )
+        overview_text.pack(fill="x")
+        if cf.get("query_overview"):
+            overview_text.insert("1.0", cf.get("query_overview", ""))
+
         tk.Label(form,text="Description *",font=(FONT,9),bg=BG,fg=MUTED).pack(anchor="w",pady=(8,4))
         dc=tk.Frame(form,bg=CARD2,highlightthickness=1,highlightbackground=BORDER); dc.pack(fill="x")
         desc_text=tk.Text(dc,font=(FONT,10),bg=CARD2,fg=TEXT,insertbackground=TEXT,relief="flat",bd=8,height=4,wrap="word",highlightthickness=0)
@@ -6516,7 +7713,8 @@ class QueryTrackerApp(tk.Tk):
             if c not in self.clients:
                 # New client — allow free typing everywhere
                 site_cb.configure(values=[])
-                fund_cb.configure(state="normal")
+                fund_cb.configure(values=self._fund_filter_values("All"),state="normal")
+                _update_debug()
                 return
             # Populate site list immediately — this is what was missing
             sites=self.sites_by_client.get(c,[])
@@ -6528,15 +7726,52 @@ class QueryTrackerApp(tk.Tk):
             utility_cb.configure(values=[])
             meter_cb.configure(values=[])
             # Populate fund list for this client
-            funds=self.funds_by_client.get(c,[])
+            funds=self._column_b_funds_for_client(c)
+            if not funds:
+                funds=self._fund_values_for_client(c)
+            if not funds:
+                funds=self._workbook_fund_values(c)
+            if not funds:
+                funds=self._fund_filter_values("All")
+            if not funds:
+                funds=self._column_b_fund_values()
             fund_cb.configure(values=funds,state="normal")
+            _set_fund_hint(funds)
             if len(funds)==1: fund_var.set(funds[0])
+            _update_debug()
+
+        def _refresh_add_fund_values(*_):
+            c=client_var.get().strip()
+            if c:
+                funds=self._column_b_funds_for_client(c)
+                if not funds:
+                    funds=self._fund_values_for_client(c)
+                if not funds:
+                    funds=self._workbook_fund_values(c)
+            else:
+                funds=[]
+            if not funds:
+                funds=self._fund_filter_values("All")
+            if not funds:
+                funds=self._column_b_fund_values()
+            fund_cb.configure(values=funds,state="normal")
+            _set_fund_hint(funds)
+            _update_debug()
 
         def on_fund(*_):
             c=client_var.get(); f=fund_var.get()
             # Filter site list by fund if one is selected
             if f:
-                sites=self.sites_by_fund.get((c,f),[])
+                sites=self._column_b_sites_for_client_fund(c,f)
+                if not sites:
+                    sites=self.sites_by_fund.get((c,f),[])
+                if not sites:
+                    c_norm=self._norm_text(c)
+                    f_norm=self._norm_text(f)
+                    for (c_key,f_key),site_list in self.sites_by_fund.items():
+                        if self._norm_text(c_key)==c_norm and self._norm_text(f_key)==f_norm:
+                            sites=list(site_list)
+                            break
             else:
                 sites=self.sites_by_client.get(c,[])
             site_cb.configure(values=sites)
@@ -6546,9 +7781,12 @@ class QueryTrackerApp(tk.Tk):
                           prop_var,address1_var,town_var,postcode_var,spid_var,serial_var,contact_var]:
                     v.set("")
                 utility_cb.configure(values=[])
+            _update_debug()
 
         def on_site(*_):
             c=client_var.get(); s=site_var.get(); key=(c,s)
+            def _norm(v):
+                return re.sub(r"\s+", " ", str(v or "").strip()).casefold()
             is_new_site = s and s not in self.sites_by_client.get(c,[])
             if is_new_site:
                 utility_cb.configure(values=UTILITY_OPTIONS,state="normal")
@@ -6560,9 +7798,39 @@ class QueryTrackerApp(tk.Tk):
                 return
             rows=self.meters.get(key,[])
             # Fill fund from site data
-            if rows and rows[0].get("fund"):
-                fund_var.set(rows[0].get("fund",""))
-                fund_cb.configure(values=self.funds_by_client.get(c,[]),state="normal")
+            site_fund=self._column_b_fund_for_client_site(c,s)
+            if rows:
+                if not site_fund:
+                    site_fund=next((str(r.get("fund","")).strip() for r in rows if str(r.get("fund","")).strip()),"")
+            if not site_fund:
+                # Fallback: derive fund from prebuilt client/fund->sites mapping.
+                for f in self.funds_by_client.get(c,[]):
+                    if s in self.sites_by_fund.get((c,f),[]):
+                        site_fund=f
+                        break
+            if not site_fund:
+                # Normalized match fallback (handles hidden whitespace differences).
+                c_norm=_norm(c)
+                s_norm=_norm(s)
+                for (c_key,f_key),site_list in self.sites_by_fund.items():
+                    if _norm(c_key)!=c_norm:
+                        continue
+                    if any(_norm(site_item)==s_norm for site_item in site_list):
+                        site_fund=str(f_key or "").strip()
+                        if site_fund:
+                            break
+            if not site_fund:
+                # Fallback to direct workbook lookup for non-standard sheets.
+                site_fund=self._resolve_fund_for_site(c,s)
+            if not site_fund:
+                # Final fallback: many clients only have one fund in the site list.
+                c_funds=[f for f in self.funds_by_client.get(c,[]) if str(f).strip()]
+                if len(c_funds)==1:
+                    site_fund=c_funds[0]
+            if site_fund:
+                fund_var.set(site_fund)
+                c_funds=self._fund_values_for_client(c)
+                fund_cb.configure(values=(c_funds if c_funds else self._fund_filter_values("All")),state="normal")
             utils=self.utilities_by_site.get(key,[])
             utility_cb.configure(values=utils,state="readonly" if utils else "normal")
             utility_var.set(""); meter_var.set(""); meter_cb.configure(values=[])
@@ -6590,6 +7858,7 @@ class QueryTrackerApp(tk.Tk):
             else:
                 related_site_lbl.config(text="")
             if nm_btn is not None: nm_btn.pack(side="left")
+            _update_debug()
 
         def on_utility(*_):
             c=client_var.get(); s=site_var.get(); u=utility_var.get(); key=(c,s)
@@ -6624,6 +7893,8 @@ class QueryTrackerApp(tk.Tk):
         type_var.trace_add("write",on_type)
         fund_cb.bind("<<ComboboxSelected>>",lambda e:on_fund())
         fund_cb.bind("<FocusOut>",lambda e:on_fund())
+        fund_cb.bind("<Button-1>",_refresh_add_fund_values)
+        fund_cb.bind("<FocusIn>",_refresh_add_fund_values)
         utility_cb.bind("<<ComboboxSelected>>",lambda _:on_utility())
 
         def _on_client_var(*_):
@@ -6646,10 +7917,18 @@ class QueryTrackerApp(tk.Tk):
 
         self._bind_autocomplete(meter_cb,get_meter_list,on_select=on_meter)
 
+        if client_var.get().strip():
+            on_client()
+            if site_var.get().strip():
+                on_site()
+
         if copy_from:
             on_client()   # populates site list
             on_site()     # populates utility list and fills fund
             if copy_from.get("utility"): utility_var.set(copy_from["utility"]); on_utility()
+        
+        # Initial debug panel update
+        _update_debug()
 
         def add_new_meter():
             c=client_var.get(); s=site_var.get()
@@ -6721,6 +8000,10 @@ class QueryTrackerApp(tk.Tk):
                 messagebox.showwarning("Required","Client, type and description are required.",parent=dlg); return
             assignee=assignee_var.get().strip()
             if assignee=="(Unassigned)": assignee=""
+            assignee_msg=self._assignee_availability_error(assignee, chase_var.get().strip())
+            if assignee_msg:
+                messagebox.showwarning("Assignee unavailable", assignee_msg, parent=dlg)
+                return
             if not self._validate_action_date(chase_var.get().strip(), parent=dlg):
                 return
             if not self._confirm_high_volume_day(
@@ -6752,6 +8035,7 @@ class QueryTrackerApp(tk.Tk):
                 live_query.update({
                     "client":client,"fund":fund_var.get().strip(),"site":site,
                     "utility":utility_var.get(),"meter":meter_var.get(),"type":type_var.get(),
+                    "query_overview":overview_text.get("1.0","end").strip(),
                     "status":status_var.get(),"priority":priority_var.get(),
                     "desc":new_desc,
                     "chase_date":new_chase,
@@ -6770,7 +8054,7 @@ class QueryTrackerApp(tk.Tk):
                         live_query["log"]+=f" | {marker}"
                 else:
                     live_query["log"]=live_query["log"].replace(f" | {marker}","").replace(marker,"")
-                if not self._save_queries():
+                if not self._save_queries(change_type="query_edit", query_id=live_query.get("id",""), description=f"Edited {live_query.get('ref','')} (details)"):
                     return
                 self._refresh_table(); self._show_daily_banner(); dlg.destroy()
                 return
@@ -6802,6 +8086,7 @@ class QueryTrackerApp(tk.Tk):
                "ref":ref_var.get() or next_ref(self.queries,type_var.get()),
                "client":client,"fund":fund_var.get().strip(),"site":site,
                "utility":utility_var.get(),"meter":meter_var.get(),"type":type_var.get(),
+                    "query_overview":overview_text.get("1.0","end").strip(),
                "status":status_var.get(),"priority":priority_var.get(),
                "desc":desc_text.get("1.0","end").strip(),"opened":today_str(),
                "chase_date":chase_var.get().strip(),"resolved_date":"",
@@ -6811,7 +8096,7 @@ class QueryTrackerApp(tk.Tk):
                "last_by":self.username,"last_date":today_str(),
                "assigned_to":assignee,"raised_date":raised}
             self.queries.insert(0,q)
-            if not self._save_queries():
+            if not self._save_queries(change_type="query_add", query_id=q.get("id",""), description=f"Added {q.get('ref','')} - {q.get('type','')}"):
                 return
             self._refresh_table(); self._show_daily_banner(); dlg.destroy()
 
@@ -6848,6 +8133,17 @@ class QueryTrackerApp(tk.Tk):
             self._open_add_dialog(edit_query=q)
         edit_btn.bind("<Button-1>",lambda e:open_edit())
         tk.Label(hdr,text=q["type"],font=(FONT,10),bg=NAV,fg=TEXT2).pack(anchor="w",pady=(6,0))
+        overview_txt=(q.get("query_overview","") or "").strip()
+        if overview_txt:
+            tk.Label(
+                hdr,
+                text=f"Overview: {overview_txt}",
+                font=(FONT,9),
+                bg=NAV,
+                fg=TEXT2,
+                justify="left",
+                wraplength=620,
+            ).pack(anchor="w",pady=(4,0))
 
         outer=tk.Frame(dlg,bg=BG); outer.pack(fill="both",expand=True)
         body,_=scrollable_frame(outer)
@@ -7064,7 +8360,7 @@ class QueryTrackerApp(tk.Tk):
             live_q["log"]+=" | "+stamp(self.username)+" "+n
             live_q["last_by"]=self.username
             live_q["last_date"]=today_str()
-            if not self._save_queries():
+            if not self._save_queries(change_type="query_edit", query_id=live_q.get("id",""), description=f"Note added on {live_q.get('ref','')}"):
                 return
             note_box.delete("1.0","end")
             note_added_since_open[0]=True
@@ -7213,7 +8509,7 @@ class QueryTrackerApp(tk.Tk):
                 self.queries=[x for x in self.queries if x["id"]!=live_q["id"]]
                 self._att_count_cache.pop(live_q.get("id",""),None)
                 self.recent_ids=[rid for rid in self.recent_ids if rid!=live_q.get("id")]
-                if not self._save_queries():
+                if not self._save_queries(change_type="query_delete", query_id=live_q.get("id",""), description=f"Deleted {live_q.get('ref','')}"):
                     return
                 self._refresh_list_if_visible(); dlg.destroy()
 
@@ -7277,6 +8573,7 @@ class QueryTrackerApp(tk.Tk):
                     "client":   current_q["client"],   "fund":  current_q.get("fund",""),
                     "site":     current_q["site"],      "utility": current_q.get("utility",""),
                     "meter":    current_q.get("meter",""), "type": new_type,
+                    "query_overview": current_q.get("query_overview",""),
                     "status":   "Open",         "priority": current_q["priority"],
                     "desc":     current_q["desc"],
                     "opened":   today_str(),    "chase_date": current_q.get("chase_date",""),
@@ -7290,7 +8587,7 @@ class QueryTrackerApp(tk.Tk):
                     "raised_date": "",
                 }
                 self.queries.insert(0, new_q)
-                if not self._save_queries():
+                if not self._save_queries(change_type="query_add", query_id=new_q.get("id",""), description=f"Type-change new query {new_q.get('ref','')}"):
                     return
                 self._refresh_table(); self._show_daily_banner()
                 ct_dlg.destroy(); dlg.destroy()
@@ -7312,6 +8609,10 @@ class QueryTrackerApp(tk.Tk):
             new_chase=chase_var.get().strip()
             assignee=assignee_var_d.get().strip()
             if assignee=="(Unassigned)": assignee=""
+            assignee_msg=self._assignee_availability_error(assignee, new_chase)
+            if assignee_msg:
+                messagebox.showwarning("Assignee unavailable", assignee_msg, parent=dlg)
+                return
             if status_var.get()!="Resolved":
                 if not self._confirm_high_volume_day(new_chase, exclude_ids=[live_q.get("id")], add_count=1, parent=dlg, assignee=assignee):
                     return
@@ -7333,7 +8634,7 @@ class QueryTrackerApp(tk.Tk):
                 live_q["resolved_date"]=today_str(); live_q["log"]+=f" | {stamp(self.username)} Marked as resolved"
             elif live_q["status"]!="Resolved":
                 live_q["resolved_date"]=""
-            if not self._save_queries():
+            if not self._save_queries(change_type="query_edit", query_id=live_q.get("id",""), description=f"Edited {live_q.get('ref','')}"):
                 return
             messagebox.showinfo("Saved", f"Changes to {live_q['ref']} have been saved successfully.", parent=dlg)
             self._excel_mtime=self._excel_mtime_now()  # update our snapshot
@@ -7475,7 +8776,7 @@ class QueryTrackerApp(tk.Tk):
                             bdr_s=Border(left=thin_s,right=thin_s,top=thin_s,bottom=thin_s)
                             hfil_s=PatternFill("solid",fgColor="0F1B2D")
                             hfnt_s=Font(bold=True,color="FFFFFF",name=FONT,size=10)
-                            col_widths=[10,12,22,22,24,18,22,18,14,10,44,12,12,14,50,30,20,20,28,14,18,14,18]
+                            col_widths=[10,12,22,22,24,18,22,18,22,14,10,44,12,12,14,50,28,16,14,20,20,28,14,18,14,18,12]
                             for ci,(col,w) in enumerate(zip(COLS,col_widths),1):
                                 hc=tws.cell(row=1,column=ci,value=col)
                                 hc.font=hfnt_s; hc.fill=hfil_s; hc.border=bdr_s
@@ -7488,16 +8789,16 @@ class QueryTrackerApp(tk.Tk):
                         row_vals=[
                             new_q["id"],new_q["ref"],new_q["client"],new_q.get("fund",""),
                             new_q["site"],new_q.get("utility",""),new_q.get("meter",""),
-                            new_q["type"],new_q["status"],new_q["priority"],new_q["desc"],
+                            new_q["type"],new_q.get("query_overview",""),new_q["status"],new_q["priority"],new_q["desc"],
                             new_q["opened"],new_q.get("chase_date",""),new_q.get("resolved_date",""),
-                            new_q["log"],new_q.get("address",""),new_q.get("spid",""),
+                            new_q["log"],new_q.get("address1",new_q.get("address","")),new_q.get("town",""),new_q.get("postcode",""),new_q.get("spid",""),
                             new_q.get("serial",""),new_q.get("contact",""),new_q.get("prop_code",""),
-                            new_q["last_by"],new_q["last_date"],new_q.get("assigned_to","")
+                            new_q["last_by"],new_q["last_date"],new_q.get("assigned_to",""),new_q.get("raised_date","")
                         ]
                         for ci,v in enumerate(row_vals,1):
                             cell=tws.cell(row=2,column=ci,value=v)
                             cell.font=Font(name=FONT,size=10)
-                            cell.alignment=Alignment(vertical="top",wrap_text=(ci in (11,15)))
+                            cell.alignment=Alignment(vertical="top",wrap_text=(ci in (12,16)))
                             cell.border=bdr_r
 
                         # ── 3. Add site to target sites.xlsx if configured ────
@@ -7561,7 +8862,7 @@ class QueryTrackerApp(tk.Tk):
                         else:
                             q["log"]+=f" | {stamp(self.username)} Transferred a copy to '{tname}'. This query remains open here."
                         q["last_by"]=self.username; q["last_date"]=today_str()
-                        self._save_queries()
+                        self._save_queries(change_type="query_edit", query_id=q.get("id",""), description=f"Transferred {q.get('ref','')}")
                         self._refresh_table(); self._show_daily_banner()
                         tr_dlg.destroy(); dlg.destroy()
                         status_note="Marked as Resolved in your tracker" if resolve_original else "Still open in your tracker"
@@ -7853,7 +9154,7 @@ class QueryTrackerApp(tk.Tk):
                     break  # Only apply first matching rule
         
         if escalated_count > 0:
-            self._save_queries()
+            self._save_queries(change_type="query_update", description=f"Auto-escalation ({escalated_count} queries)")
         
         return escalated_count
 
