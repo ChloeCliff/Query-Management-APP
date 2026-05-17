@@ -3117,6 +3117,10 @@ class QueryTrackerApp(tk.Tk):
         self._watcher_seen=set()
         # Attachment count cache: {query_id: int} — avoids per-row filesystem hits in _refresh_table
         self._att_count_cache={}
+        # Cache parsed site rows (client, fund-from-col-B, site) so fund
+        # filters and dropdowns do not repeatedly reload sites.xlsx on UI events.
+        self._sites_rows_col_b_cache=[]
+        self._sites_rows_col_b_cache_key=None
         self._list_dirty=True
         self._metrics_dirty=True
         self._cal_refresh_after_id=None
@@ -3254,37 +3258,11 @@ class QueryTrackerApp(tk.Tk):
         Some real-world site lists are too irregular for header mapping but
         still keep Fund in column B. This bypasses client/site linking entirely.
         """
-        sf=getattr(self,"sites_file","")
-        if not sf or not os.path.exists(sf):
-            return []
-
-        try:
-            wb=openpyxl.load_workbook(sf,data_only=True)
-        except Exception:
-            return []
-
-        ws=None
-        for name in ["Sites","Site","sites","site","Sheet1","Sheet"]:
-            if name in wb.sheetnames:
-                ws=wb[name]
-                break
-        if ws is None:
-            ws=wb.active
-
-        skip_exact={"fund","fund name","name of fund","column b","b"}
-        skip_contains={"example","must be","instruction","note:"}
-
         out=[]
-        for row in ws.iter_rows(min_row=1, values_only=True):
-            val=str((row[1] if len(row)>1 else "") or "").strip()
-            if not val:
-                continue
-            low=val.lower()
-            if low in skip_exact:
-                continue
-            if any(tok in low for tok in skip_contains):
-                continue
-            out.append(val)
+        for _client,fund,_site in self._read_sites_rows_column_b():
+            txt=str(fund or "").strip()
+            if txt:
+                out.append(txt)
 
         seen=set(); uniq=[]
         for raw in out:
@@ -3304,6 +3282,15 @@ class QueryTrackerApp(tk.Tk):
         sf=getattr(self,"sites_file","")
         if not sf or not os.path.exists(sf):
             return []
+
+        try:
+            st=os.stat(sf)
+            cache_key=(sf,float(getattr(st,"st_mtime",0.0)),int(getattr(st,"st_size",0)))
+        except Exception:
+            cache_key=(sf,None,None)
+
+        if getattr(self,"_sites_rows_col_b_cache_key",None)==cache_key:
+            return list(getattr(self,"_sites_rows_col_b_cache",[]) or [])
 
         try:
             wb=openpyxl.load_workbook(sf,data_only=True)
@@ -3377,7 +3364,9 @@ class QueryTrackerApp(tk.Tk):
                 continue
             out.append((client,fund,site))
 
-        return out
+        self._sites_rows_col_b_cache=list(out)
+        self._sites_rows_col_b_cache_key=cache_key
+        return list(out)
 
     def _column_b_funds_for_client(self, client_name):
         target=self._norm_text(client_name)
